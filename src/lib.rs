@@ -103,6 +103,24 @@ pub struct PerformanceSnapshot {
     pub min_frame_time: f64,   // Min frame time in window  
     pub max_frame_time: f64,   // Max frame time in window
     pub frame_count: u32,      // Total frames since start
+    
+    // Camera tracking metrics
+    pub camera_updates_per_sec: f64,    // How often camera changes
+    pub camera_dirty_ratio: f64,        // % of frames where camera changed
+    
+    // Memory/Buffer tracking
+    pub buffer_uploads_per_sec: f64,    // Buffer upload frequency
+    pub bytes_uploaded_per_sec: f64,    // Memory bandwidth usage
+    pub uniform_updates_per_sec: f64,   // Uniform buffer update frequency
+    
+    // Performance breakdown (in microseconds)
+    pub matrix_calc_time_us: f64,       // Time spent on matrix calculations
+    pub buffer_upload_time_us: f64,     // Time spent uploading buffers
+    pub gpu_submit_time_us: f64,        // Time spent submitting GPU commands
+    
+    // Efficiency ratios
+    pub cpu_utilization_ratio: f64,     // CPU work / total frame time
+    pub memory_efficiency: f64,         // Useful uploads / total uploads
 }
 
 struct PerformanceTracker {
@@ -114,6 +132,23 @@ struct PerformanceTracker {
     
     // Export interval (100ms = 10Hz)
     export_interval: f64,
+    
+    // Camera state tracking
+    last_camera_state: (f32, f32, f32, f32, f32), // (distance, pan_x, pan_y, rot_x, rot_y)
+    camera_updates: VecDeque<f64>, // timestamps of camera changes
+    
+    // Memory/Buffer tracking  
+    buffer_uploads: VecDeque<(f64, u32)>, // (timestamp, bytes) pairs
+    uniform_updates: VecDeque<f64>, // timestamps of uniform buffer updates
+    
+    // Performance timing breakdown
+    current_matrix_calc_time: f64,
+    current_buffer_upload_time: f64, 
+    current_gpu_submit_time: f64,
+    
+    // Running totals for efficiency calculations
+    total_cpu_time: f64,
+    total_gpu_time: f64,
 }
 
 impl PerformanceTracker {
@@ -126,6 +161,15 @@ impl PerformanceTracker {
             last_export: now,
             total_frames: 0,
             export_interval: 100.0, // 100ms
+            last_camera_state: (5.0, 0.0, 0.0, 0.0, 0.0),
+            camera_updates: VecDeque::new(),
+            buffer_uploads: VecDeque::new(),
+            uniform_updates: VecDeque::new(),
+            current_matrix_calc_time: 0.0,
+            current_buffer_upload_time: 0.0,
+            current_gpu_submit_time: 0.0,
+            total_cpu_time: 0.0,
+            total_gpu_time: 0.0,
         }
     }
     
@@ -170,6 +214,16 @@ impl PerformanceTracker {
                 min_frame_time: 0.0,
                 max_frame_time: 0.0,
                 frame_count: self.total_frames,
+                camera_updates_per_sec: 0.0,
+                camera_dirty_ratio: 0.0,
+                buffer_uploads_per_sec: 0.0,
+                bytes_uploaded_per_sec: 0.0,
+                uniform_updates_per_sec: 0.0,
+                matrix_calc_time_us: 0.0,
+                buffer_upload_time_us: 0.0,
+                gpu_submit_time_us: 0.0,
+                cpu_utilization_ratio: 0.0,
+                memory_efficiency: 0.0,
             };
         }
         
@@ -186,6 +240,39 @@ impl PerformanceTracker {
         let min_frame_time = durations.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         let max_frame_time = durations.iter().fold(0.0f64, |a, &b| a.max(b));
         
+        // Calculate camera update metrics
+        let one_second_ago = now - 1000.0;
+        let recent_camera_updates = self.camera_updates.iter()
+            .filter(|&&timestamp| timestamp > one_second_ago)
+            .count() as f64;
+        let camera_updates_per_sec = recent_camera_updates;
+        let camera_dirty_ratio = if window_size > 0.0 { recent_camera_updates / window_size } else { 0.0 };
+        
+        // Calculate buffer metrics
+        let recent_buffer_uploads = self.buffer_uploads.iter()
+            .filter(|(timestamp, _)| *timestamp > one_second_ago)
+            .count() as f64;
+        let total_bytes_uploaded: u32 = self.buffer_uploads.iter()
+            .filter(|(timestamp, _)| *timestamp > one_second_ago)
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        let bytes_uploaded_per_sec = total_bytes_uploaded as f64;
+        
+        let recent_uniform_updates = self.uniform_updates.iter()
+            .filter(|&&timestamp| timestamp > one_second_ago)
+            .count() as f64;
+        
+        // Calculate efficiency ratios
+        let total_frame_time = avg_frame_time;
+        let cpu_time = self.current_matrix_calc_time + self.current_buffer_upload_time;
+        let cpu_utilization_ratio = if total_frame_time > 0.0 { cpu_time / total_frame_time } else { 0.0 };
+        
+        let memory_efficiency = if recent_buffer_uploads > 0.0 { 
+            recent_uniform_updates / recent_buffer_uploads 
+        } else { 
+            1.0 
+        };
+        
         PerformanceSnapshot {
             timestamp: now - self.session_start,
             fps,
@@ -193,6 +280,67 @@ impl PerformanceTracker {
             min_frame_time,
             max_frame_time,
             frame_count: self.total_frames,
+            camera_updates_per_sec,
+            camera_dirty_ratio,
+            buffer_uploads_per_sec: recent_buffer_uploads,
+            bytes_uploaded_per_sec,
+            uniform_updates_per_sec: recent_uniform_updates,
+            matrix_calc_time_us: self.current_matrix_calc_time * 1000.0, // Convert to μs
+            buffer_upload_time_us: self.current_buffer_upload_time * 1000.0, // Convert to μs  
+            gpu_submit_time_us: self.current_gpu_submit_time * 1000.0, // Convert to μs
+            cpu_utilization_ratio,
+            memory_efficiency,
+        }
+    }
+    
+    fn track_camera_change(&mut self, distance: f32, pan_x: f32, pan_y: f32, rot_x: f32, rot_y: f32) {
+        let current_state = (distance, pan_x, pan_y, rot_x, rot_y);
+        
+        // Check if camera state actually changed  
+        if current_state != self.last_camera_state {
+            let now = now();
+            self.camera_updates.push_back(now);
+            self.last_camera_state = current_state;
+            
+            // Clean old camera updates (older than 1 second)
+            let one_second_ago = now - 1000.0;
+            while let Some(&timestamp) = self.camera_updates.front() {
+                if timestamp < one_second_ago {
+                    self.camera_updates.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    
+    fn track_buffer_upload(&mut self, bytes: u32) {
+        let now = now();
+        self.buffer_uploads.push_back((now, bytes));
+        
+        // Clean old buffer uploads (older than 1 second)
+        let one_second_ago = now - 1000.0;
+        while let Some(&(timestamp, _)) = self.buffer_uploads.front() {
+            if timestamp < one_second_ago {
+                self.buffer_uploads.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+    
+    fn track_uniform_update(&mut self) {
+        let now = now();
+        self.uniform_updates.push_back(now);
+        
+        // Clean old uniform updates (older than 1 second)
+        let one_second_ago = now - 1000.0;
+        while let Some(&timestamp) = self.uniform_updates.front() {
+            if timestamp < one_second_ago {
+                self.uniform_updates.pop_front();
+            } else {
+                break;
+            }
         }
     }
 }
@@ -219,6 +367,9 @@ pub struct CubeRenderer {
     camera_pan_y: f32,
     camera_rotation_x: f32, // Pitch (up/down rotation)
     camera_rotation_y: f32, // Yaw (left/right rotation)
+    
+    // Dirty tracking for optimization
+    uniforms_dirty: bool,
     
     // Background color
     background_color: wgpu::Color,
@@ -550,6 +701,7 @@ impl CubeRenderer {
             camera_rotation_y: 0.0,
             background_color: bg_color,
             performance_tracker: PerformanceTracker::new(),
+            uniforms_dirty: true,
         })
     }
 
@@ -561,6 +713,10 @@ impl CubeRenderer {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
+            
+            // Mark uniforms dirty since aspect ratio changed
+            self.mark_uniforms_dirty();
+            
             console::log_1(&format!("Resized canvas to width: {}, height: {}", width, height).into());
         }
     }
@@ -576,6 +732,9 @@ impl CubeRenderer {
         
         // Clamp camera distance to reasonable bounds
         self.camera_distance = self.camera_distance.clamp(1.0, 50.0);
+        
+        // Mark uniforms dirty since camera changed
+        self.mark_uniforms_dirty();
     }
 
     #[wasm_bindgen]
@@ -587,6 +746,9 @@ impl CubeRenderer {
         // Invert deltaX and deltaY so dragging feels like moving the object directly
         self.camera_pan_x -= delta_x * pan_sensitivity; // Invert X for natural movement
         self.camera_pan_y += delta_y * pan_sensitivity; // Invert Y for natural movement
+        
+        // Mark uniforms dirty since camera changed
+        self.mark_uniforms_dirty();
     }
 
     #[wasm_bindgen]
@@ -600,6 +762,14 @@ impl CubeRenderer {
         
         // Clamp pitch to prevent gimbal lock
         self.camera_rotation_x = self.camera_rotation_x.clamp(-1.5, 1.5);
+        
+        // Mark uniforms dirty since camera changed
+        self.mark_uniforms_dirty();
+    }
+    
+    // Helper method to mark uniforms as dirty
+    fn mark_uniforms_dirty(&mut self) {
+        self.uniforms_dirty = true;
     }
 
     #[wasm_bindgen]
@@ -607,42 +777,81 @@ impl CubeRenderer {
         // Start performance tracking for this frame
         self.performance_tracker.start_frame();
         
-        // Create transformation matrices
-        let aspect = self.width as f32 / self.height as f32;
-        let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
-        
-        // Create orbital camera system
-        // 1. Apply rotations around the target
-        let rotation_y = cgmath::Matrix4::from_angle_y(cgmath::Rad(self.camera_rotation_y));
-        let rotation_x = cgmath::Matrix4::from_angle_x(cgmath::Rad(self.camera_rotation_x));
-        let rotation_matrix = rotation_y * rotation_x;
-        
-        // 2. Position camera at distance from target
-        let camera_offset = cgmath::Vector3::new(0.0, 0.0, self.camera_distance);
-        let rotated_offset = rotation_matrix.transform_vector(camera_offset);
-        
-        // 3. Apply pan offset to target position
-        let target = cgmath::Point3::new(self.camera_pan_x, self.camera_pan_y, 0.0);
-        let camera_position = target + rotated_offset;
-        
-        // 4. Create view matrix
-        let view = cgmath::Matrix4::look_at_rh(
-            camera_position,
-            target,
-            cgmath::Vector3::unit_y(),
+        // Track camera state changes for performance metrics
+        self.performance_tracker.track_camera_change(
+            self.camera_distance,
+            self.camera_pan_x,
+            self.camera_pan_y,
+            self.camera_rotation_x,
+            self.camera_rotation_y,
         );
+        
+        // Only recalculate matrices and update uniforms if camera changed
+        if self.uniforms_dirty {
+            // Time matrix calculations
+            let matrix_start = now();
+            
+            // Create transformation matrices
+            let aspect = self.width as f32 / self.height as f32;
+            let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
+            
+            // Create orbital camera system
+            // 1. Apply rotations around the target
+            let rotation_y = cgmath::Matrix4::from_angle_y(cgmath::Rad(self.camera_rotation_y));
+            let rotation_x = cgmath::Matrix4::from_angle_x(cgmath::Rad(self.camera_rotation_x));
+            let rotation_matrix = rotation_y * rotation_x;
+            
+            // 2. Position camera at distance from target
+            let camera_offset = cgmath::Vector3::new(0.0, 0.0, self.camera_distance);
+            let rotated_offset = rotation_matrix.transform_vector(camera_offset);
+            
+            // 3. Apply pan offset to target position
+            let target = cgmath::Point3::new(self.camera_pan_x, self.camera_pan_y, 0.0);
+            let camera_position = target + rotated_offset;
+            
+            // 4. Create view matrix
+            let view = cgmath::Matrix4::look_at_rh(
+                camera_position,
+                target,
+                cgmath::Vector3::unit_y(),
+            );
 
-        // Static model matrix (object stays at origin)
-        let model = cgmath::Matrix4::identity();
+            // Static model matrix (object stays at origin)
+            let model = cgmath::Matrix4::identity();
 
-        let view_proj = proj * view * model;
-        self.uniforms.update_view_proj(view_proj);
+            let view_proj = proj * view * model;
+            self.uniforms.update_view_proj(view_proj);
+            
+            // Record matrix calculation time
+            let matrix_end = now();
+            self.performance_tracker.current_matrix_calc_time = matrix_end - matrix_start;
 
-        self.queue.write_buffer(
-            &self.uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[self.uniforms]),
-        );
+            // Time buffer upload
+            let buffer_start = now();
+            
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[self.uniforms]),
+            );
+            
+            // Track buffer upload (uniform buffer is 64 bytes: 4x4 f32 matrix)
+            self.performance_tracker.track_buffer_upload(64);
+            self.performance_tracker.track_uniform_update();
+            
+            let buffer_end = now();
+            self.performance_tracker.current_buffer_upload_time = buffer_end - buffer_start;
+            
+            // Mark uniforms as clean now that we've updated them
+            self.uniforms_dirty = false;
+        } else {
+            // Camera hasn't changed, so we skip expensive operations
+            self.performance_tracker.current_matrix_calc_time = 0.0;
+            self.performance_tracker.current_buffer_upload_time = 0.0;
+        }
+
+        // Time GPU submission (this always happens)
+        let gpu_start = now();
 
         let output = self.surface
             .get_current_texture()
@@ -683,6 +892,9 @@ impl CubeRenderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        let gpu_end = now();
+        self.performance_tracker.current_gpu_submit_time = gpu_end - gpu_start;
 
         // End performance tracking and return snapshot if available
         // Note: We don't return the snapshot from render() to avoid affecting performance
