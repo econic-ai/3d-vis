@@ -1,9 +1,22 @@
 mod utils;
 
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, console};
+use web_sys::{HtmlCanvasElement, console, Performance};
 use wgpu::util::DeviceExt;
 use cgmath::prelude::*;
+use std::collections::VecDeque;
+
+// WASM-compatible performance timing
+fn performance() -> Performance {
+    web_sys::window()
+        .expect("should have a window in this context")
+        .performance()
+        .expect("performance should be available")
+}
+
+fn now() -> f64 {
+    performance().now()
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -82,6 +95,109 @@ impl Uniforms {
 }
 
 #[wasm_bindgen]
+#[derive(Clone, Copy)]
+pub struct PerformanceSnapshot {
+    pub timestamp: f64,        // Milliseconds since session start
+    pub fps: f64,              // Current FPS
+    pub frame_time_ms: f64,    // Average frame time in window
+    pub min_frame_time: f64,   // Min frame time in window  
+    pub max_frame_time: f64,   // Max frame time in window
+    pub frame_count: u32,      // Total frames since start
+}
+
+struct PerformanceTracker {
+    frame_times: VecDeque<(f64, f64)>, // (timestamp, duration) pairs in milliseconds
+    session_start: f64,
+    last_frame_start: Option<f64>,
+    last_export: f64,
+    total_frames: u32,
+    
+    // Export interval (100ms = 10Hz)
+    export_interval: f64,
+}
+
+impl PerformanceTracker {
+    fn new() -> Self {
+        let now = now();
+        Self {
+            frame_times: VecDeque::new(),
+            session_start: now,
+            last_frame_start: None,
+            last_export: now,
+            total_frames: 0,
+            export_interval: 100.0, // 100ms
+        }
+    }
+    
+    fn start_frame(&mut self) {
+        self.last_frame_start = Some(now());
+    }
+    
+    fn end_frame(&mut self) -> Option<PerformanceSnapshot> {
+        if let Some(frame_start) = self.last_frame_start.take() {
+            let frame_end = now();
+            let frame_duration = frame_end - frame_start;
+            
+            // Add this frame to our rolling window
+            self.frame_times.push_back((frame_start, frame_duration));
+            self.total_frames += 1;
+            
+            // Remove frames older than 1 second for rolling calculation
+            let one_second_ago = frame_end - 1000.0; // 1 second = 1000ms
+            while let Some(&(timestamp, _)) = self.frame_times.front() {
+                if timestamp < one_second_ago {
+                    self.frame_times.pop_front();
+                } else {
+                    break;
+                }
+            }
+            
+            // Check if we should export a snapshot
+            if frame_end - self.last_export >= self.export_interval {
+                self.last_export = frame_end;
+                return Some(self.create_snapshot(frame_end));
+            }
+        }
+        None
+    }
+    
+    fn create_snapshot(&self, now: f64) -> PerformanceSnapshot {
+        if self.frame_times.is_empty() {
+            return PerformanceSnapshot {
+                timestamp: now - self.session_start,
+                fps: 0.0,
+                frame_time_ms: 0.0,
+                min_frame_time: 0.0,
+                max_frame_time: 0.0,
+                frame_count: self.total_frames,
+            };
+        }
+        
+        // Calculate metrics from rolling window (last 1 second)
+        let window_size = self.frame_times.len() as f64;
+        let fps = window_size; // frames in 1 second = FPS
+        
+        let durations: Vec<f64> = self.frame_times
+            .iter()
+            .map(|(_, duration)| *duration)
+            .collect();
+        
+        let avg_frame_time = durations.iter().sum::<f64>() / window_size;
+        let min_frame_time = durations.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_frame_time = durations.iter().fold(0.0f64, |a, &b| a.max(b));
+        
+        PerformanceSnapshot {
+            timestamp: now - self.session_start,
+            fps,
+            frame_time_ms: avg_frame_time,
+            min_frame_time,
+            max_frame_time,
+            frame_count: self.total_frames,
+        }
+    }
+}
+
+#[wasm_bindgen]
 pub struct CubeRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -99,9 +215,16 @@ pub struct CubeRenderer {
     
     // Camera controls
     camera_distance: f32,
+    camera_pan_x: f32,
+    camera_pan_y: f32,
+    camera_rotation_x: f32, // Pitch (up/down rotation)
+    camera_rotation_y: f32, // Yaw (left/right rotation)
     
     // Background color
     background_color: wgpu::Color,
+    
+    // Performance tracking
+    performance_tracker: PerformanceTracker,
 }
 
 #[wasm_bindgen]
@@ -421,7 +544,12 @@ impl CubeRenderer {
             uniform_buffer,
             uniform_bind_group,
             camera_distance: 5.0,
+            camera_pan_x: 0.0,
+            camera_pan_y: 0.0,
+            camera_rotation_x: 0.0,
+            camera_rotation_y: 0.0,
             background_color: bg_color,
+            performance_tracker: PerformanceTracker::new(),
         })
     }
 
@@ -451,17 +579,60 @@ impl CubeRenderer {
     }
 
     #[wasm_bindgen]
+    pub fn pan(&mut self, delta_x: f32, delta_y: f32) {
+        // Pan by adjusting the target position
+        // Scale pan sensitivity based on camera distance (further = larger pan movements)
+        let pan_sensitivity = 0.001 * self.camera_distance;
+        
+        // Invert deltaX and deltaY so dragging feels like moving the object directly
+        self.camera_pan_x -= delta_x * pan_sensitivity; // Invert X for natural movement
+        self.camera_pan_y += delta_y * pan_sensitivity; // Invert Y for natural movement
+    }
+
+    #[wasm_bindgen]
+    pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
+        // Rotate camera around target (orbital rotation)
+        let rotation_sensitivity = 0.001;
+        
+        // Invert deltas so dragging feels like rotating the object directly
+        self.camera_rotation_y -= delta_x * rotation_sensitivity; // Invert Yaw for natural rotation
+        self.camera_rotation_x -= delta_y * rotation_sensitivity; // Invert Pitch for natural rotation
+        
+        // Clamp pitch to prevent gimbal lock
+        self.camera_rotation_x = self.camera_rotation_x.clamp(-1.5, 1.5);
+    }
+
+    #[wasm_bindgen]
     pub fn render(&mut self) -> Result<(), JsValue> {
+        // Start performance tracking for this frame
+        self.performance_tracker.start_frame();
+        
         // Create transformation matrices
         let aspect = self.width as f32 / self.height as f32;
         let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
+        
+        // Create orbital camera system
+        // 1. Apply rotations around the target
+        let rotation_y = cgmath::Matrix4::from_angle_y(cgmath::Rad(self.camera_rotation_y));
+        let rotation_x = cgmath::Matrix4::from_angle_x(cgmath::Rad(self.camera_rotation_x));
+        let rotation_matrix = rotation_y * rotation_x;
+        
+        // 2. Position camera at distance from target
+        let camera_offset = cgmath::Vector3::new(0.0, 0.0, self.camera_distance);
+        let rotated_offset = rotation_matrix.transform_vector(camera_offset);
+        
+        // 3. Apply pan offset to target position
+        let target = cgmath::Point3::new(self.camera_pan_x, self.camera_pan_y, 0.0);
+        let camera_position = target + rotated_offset;
+        
+        // 4. Create view matrix
         let view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(0.0, 0.0, self.camera_distance),
-            cgmath::Point3::new(0.0, 0.0, 0.0),
+            camera_position,
+            target,
             cgmath::Vector3::unit_y(),
         );
 
-        // Static model matrix (no rotation)
+        // Static model matrix (object stays at origin)
         let model = cgmath::Matrix4::identity();
 
         let view_proj = proj * view * model;
@@ -513,6 +684,23 @@ impl CubeRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
+        // End performance tracking and return snapshot if available
+        // Note: We don't return the snapshot from render() to avoid affecting performance
+        // JavaScript will poll for snapshots separately
+        self.performance_tracker.end_frame();
+
         Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn get_performance_snapshot(&mut self) -> Option<PerformanceSnapshot> {
+        // Force create a snapshot for JavaScript to consume
+        // This is called periodically from JavaScript, not every frame
+        if !self.performance_tracker.frame_times.is_empty() {
+            let now = now();
+            Some(self.performance_tracker.create_snapshot(now))
+        } else {
+            None
+        }
     }
 } 
