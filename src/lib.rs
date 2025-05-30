@@ -4,8 +4,6 @@ use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, console};
 use wgpu::util::DeviceExt;
 use cgmath::prelude::*;
-use rand::Rng;
-use std::f32::consts::PI;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -99,12 +97,8 @@ pub struct CubeRenderer {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     
-    // Animation state
-    rotation_x: f32,
-    rotation_y: f32,
-    rotation_speed_x: f32,
-    rotation_speed_y: f32,
-    last_time: f64,
+    // Camera controls
+    camera_distance: f32,
     
     // Background color
     background_color: wgpu::Color,
@@ -159,24 +153,14 @@ impl CubeRenderer {
         // Parse background color from hex string
         let bg_color = Self::parse_hex_color(background_color)?;
         
-        let mut rng = rand::thread_rng();
-        
-        // Generate random rotation speeds (1-10 seconds per full rotation)
-        let rotation_speed_x = 2.0 * PI / rng.gen_range(1.0..10.0);
-        let rotation_speed_y = 2.0 * PI / rng.gen_range(1.0..10.0);
-        
-        console::log_1(
-            &format!(
-                "Canvas width: {}, height: {}, Rotation speeds: X={:.2} rad/s, Y={:.2} rad/s",
-                canvas.width(), canvas.height(), rotation_speed_x, rotation_speed_y).into()
-            );
+        console::log_1(&format!("Canvas width: {}, height: {}", canvas.width(), canvas.height()).into());
 
         let width = canvas.width();
         let height = canvas.height();
 
         if force_webgl {
             console::log_1(&"🔧 TESTING: Forcing WebGL backend".into());
-            return Self::create_webgl_renderer(canvas, width, height, rotation_speed_x, rotation_speed_y, bg_color).await;
+            return Self::create_webgl_renderer(canvas, width, height, bg_color).await;
         }
 
         // Try WebGPU first, fall back to WebGL if it fails
@@ -217,19 +201,17 @@ impl CubeRenderer {
                 console::log_1(&"🔄 Falling back to WebGL...".into());
                 
                 // Use the reusable WebGL function for fallback
-                return Self::create_webgl_renderer(canvas_clone, width, height, rotation_speed_x, rotation_speed_y, bg_color).await;
+                return Self::create_webgl_renderer(canvas_clone, width, height, bg_color).await;
             }
         };
 
-        Self::create_with_adapter_and_surface(adapter, surface, width, height, rotation_speed_x, rotation_speed_y, bg_color).await
+        Self::create_with_adapter_and_surface(adapter, surface, width, height, bg_color).await
     }
 
     async fn create_webgl_renderer(
         canvas: HtmlCanvasElement,
         width: u32,
         height: u32,
-        rotation_speed_x: f32,
-        rotation_speed_y: f32,
         bg_color: wgpu::Color,
     ) -> Result<CubeRenderer, JsValue> {
         let webgl_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -258,7 +240,7 @@ impl CubeRenderer {
         
         console::log_1(&format!("✅ WebGL adapter acquired successfully using: {:?}", webgl_adapter.get_info().backend).into());
         
-        Self::create_with_adapter_and_surface(webgl_adapter, webgl_surface, width, height, rotation_speed_x, rotation_speed_y, bg_color).await
+        Self::create_with_adapter_and_surface(webgl_adapter, webgl_surface, width, height, bg_color).await
     }
 
     async fn create_with_adapter_and_surface(
@@ -266,8 +248,6 @@ impl CubeRenderer {
         surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
-        rotation_speed_x: f32,
-        rotation_speed_y: f32,
         bg_color: wgpu::Color,
     ) -> Result<CubeRenderer, JsValue> {
         // Log adapter information
@@ -424,11 +404,6 @@ impl CubeRenderer {
 
         let num_indices = INDICES.len() as u32;
 
-        // Get current time
-        let window = web_sys::window().unwrap();
-        let performance = window.performance().unwrap();
-        let last_time = performance.now();
-
         console::log_1(&"🎉 CubeRenderer created successfully!".into());
 
         Ok(Self {
@@ -445,11 +420,7 @@ impl CubeRenderer {
             uniforms,
             uniform_buffer,
             uniform_bind_group,
-            rotation_x: 0.0,
-            rotation_y: 0.0,
-            rotation_speed_x,
-            rotation_speed_y,
-            last_time,
+            camera_distance: 5.0,
             background_color: bg_color,
         })
     }
@@ -467,28 +438,31 @@ impl CubeRenderer {
     }
 
     #[wasm_bindgen]
+    pub fn zoom(&mut self, delta: f32) {
+        // Zoom by adjusting camera distance
+        // Positive delta = zoom in (get closer), negative = zoom out (get farther)
+        let zoom_sensitivity = 0.1;
+        let zoom_factor = 1.0 + (delta * zoom_sensitivity);
+        
+        self.camera_distance /= zoom_factor;
+        
+        // Clamp camera distance to reasonable bounds
+        self.camera_distance = self.camera_distance.clamp(1.0, 50.0);
+    }
+
+    #[wasm_bindgen]
     pub fn render(&mut self) -> Result<(), JsValue> {
-        // Update time and rotation
-        let window = web_sys::window().unwrap();
-        let performance = window.performance().unwrap();
-        let current_time = performance.now();
-        let delta_time = (current_time - self.last_time) / 1000.0; // Convert to seconds
-        self.last_time = current_time;
-
-        self.rotation_x += self.rotation_speed_x * delta_time as f32;
-        self.rotation_y += self.rotation_speed_y * delta_time as f32;
-
         // Create transformation matrices
         let aspect = self.width as f32 / self.height as f32;
         let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
         let view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(0.0, 0.0, 5.0),
+            cgmath::Point3::new(0.0, 0.0, self.camera_distance),
             cgmath::Point3::new(0.0, 0.0, 0.0),
             cgmath::Vector3::unit_y(),
         );
 
-        let model = cgmath::Matrix4::from_angle_x(cgmath::Rad(self.rotation_x))
-            * cgmath::Matrix4::from_angle_y(cgmath::Rad(self.rotation_y));
+        // Static model matrix (no rotation)
+        let model = cgmath::Matrix4::identity();
 
         let view_proj = proj * view * model;
         self.uniforms.update_view_proj(view_proj);
