@@ -1,346 +1,34 @@
 mod utils;
+mod performance;
+mod types;
+mod camera;
+mod math;
 
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, console, Performance};
+use web_sys::{HtmlCanvasElement, console};
 use wgpu::util::DeviceExt;
-use cgmath::prelude::*;
-use std::collections::VecDeque;
+use cgmath::Point3;
 
-// WASM-compatible performance timing
-fn performance() -> Performance {
-    web_sys::window()
-        .expect("should have a window in this context")
-        .performance()
-        .expect("performance should be available")
+// Re-export from modules
+pub use performance::{PerformanceSnapshot, PerformanceTracker, now};
+pub use types::{Vertex, Uniforms, VERTICES, INDICES, InstanceData};
+pub use camera::Camera;
+pub use math::{Frustum, BoundingSphere};
+
+// Simple renderable object for demonstrating frustum culling
+#[derive(Debug, Clone)]
+struct RenderableObject {
+    position: Point3<f32>,
+    bounding_sphere: BoundingSphere,
+    visible: bool, // Result of frustum culling
 }
 
-fn now() -> f64 {
-    performance().now()
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
-
-impl Vertex {
-    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-            ],
-        }
-    }
-}
-
-// Cube vertices with colors
-const VERTICES: &[Vertex] = &[
-    // Front face (red)
-    Vertex { position: [-1.0, -1.0,  1.0], color: [1.0, 0.0, 0.0] },
-    Vertex { position: [ 1.0, -1.0,  1.0], color: [1.0, 0.0, 0.0] },
-    Vertex { position: [ 1.0,  1.0,  1.0], color: [1.0, 0.0, 0.0] },
-    Vertex { position: [-1.0,  1.0,  1.0], color: [1.0, 0.0, 0.0] },
-    
-    // Back face (green)
-    Vertex { position: [-1.0, -1.0, -1.0], color: [0.0, 1.0, 0.0] },
-    Vertex { position: [ 1.0, -1.0, -1.0], color: [0.0, 1.0, 0.0] },
-    Vertex { position: [ 1.0,  1.0, -1.0], color: [0.0, 1.0, 0.0] },
-    Vertex { position: [-1.0,  1.0, -1.0], color: [0.0, 1.0, 0.0] },
-];
-
-const INDICES: &[u16] = &[
-    // Front face
-    0, 1, 2,  2, 3, 0,
-    // Back face
-    4, 6, 5,  6, 4, 7,
-    // Left face
-    4, 0, 3,  3, 7, 4,
-    // Right face
-    1, 5, 6,  6, 2, 1,
-    // Top face
-    3, 2, 6,  6, 7, 3,
-    // Bottom face
-    4, 5, 1,  1, 0, 4,
-];
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    view_proj: [[f32; 4]; 4],
-}
-
-impl Uniforms {
-    fn new() -> Self {
+impl RenderableObject {
+    fn new(position: Point3<f32>, size: f32) -> Self {
         Self {
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
-    }
-
-    fn update_view_proj(&mut self, view_proj: cgmath::Matrix4<f32>) {
-        self.view_proj = view_proj.into();
-    }
-}
-
-#[wasm_bindgen]
-#[derive(Clone, Copy)]
-pub struct PerformanceSnapshot {
-    pub timestamp: f64,        // Milliseconds since session start
-    pub fps: f64,              // Current FPS
-    pub frame_time_ms: f64,    // Average frame time in window
-    pub min_frame_time: f64,   // Min frame time in window  
-    pub max_frame_time: f64,   // Max frame time in window
-    pub frame_count: u32,      // Total frames since start
-    
-    // Camera tracking metrics
-    pub camera_updates_per_sec: f64,    // How often camera changes
-    pub camera_dirty_ratio: f64,        // % of frames where camera changed
-    
-    // Memory/Buffer tracking
-    pub buffer_uploads_per_sec: f64,    // Buffer upload frequency
-    pub bytes_uploaded_per_sec: f64,    // Memory bandwidth usage
-    pub uniform_updates_per_sec: f64,   // Uniform buffer update frequency
-    
-    // Performance breakdown (in microseconds)
-    pub matrix_calc_time_us: f64,       // Time spent on matrix calculations
-    pub buffer_upload_time_us: f64,     // Time spent uploading buffers
-    pub gpu_submit_time_us: f64,        // Time spent submitting GPU commands
-    
-    // Efficiency ratios
-    pub cpu_utilization_ratio: f64,     // CPU work / total frame time
-    pub memory_efficiency: f64,         // Useful uploads / total uploads
-}
-
-struct PerformanceTracker {
-    frame_times: VecDeque<(f64, f64)>, // (timestamp, duration) pairs in milliseconds
-    session_start: f64,
-    last_frame_start: Option<f64>,
-    last_export: f64,
-    total_frames: u32,
-    
-    // Export interval (100ms = 10Hz)
-    export_interval: f64,
-    
-    // Camera state tracking
-    last_camera_state: (f32, f32, f32, f32, f32), // (distance, pan_x, pan_y, rot_x, rot_y)
-    camera_updates: VecDeque<f64>, // timestamps of camera changes
-    
-    // Memory/Buffer tracking  
-    buffer_uploads: VecDeque<(f64, u32)>, // (timestamp, bytes) pairs
-    uniform_updates: VecDeque<f64>, // timestamps of uniform buffer updates
-    
-    // Performance timing breakdown
-    current_matrix_calc_time: f64,
-    current_buffer_upload_time: f64, 
-    current_gpu_submit_time: f64,
-    
-    // Running totals for efficiency calculations
-    total_cpu_time: f64,
-    total_gpu_time: f64,
-}
-
-impl PerformanceTracker {
-    fn new() -> Self {
-        let now = now();
-        Self {
-            frame_times: VecDeque::new(),
-            session_start: now,
-            last_frame_start: None,
-            last_export: now,
-            total_frames: 0,
-            export_interval: 100.0, // 100ms
-            last_camera_state: (5.0, 0.0, 0.0, 0.0, 0.0),
-            camera_updates: VecDeque::new(),
-            buffer_uploads: VecDeque::new(),
-            uniform_updates: VecDeque::new(),
-            current_matrix_calc_time: 0.0,
-            current_buffer_upload_time: 0.0,
-            current_gpu_submit_time: 0.0,
-            total_cpu_time: 0.0,
-            total_gpu_time: 0.0,
-        }
-    }
-    
-    fn start_frame(&mut self) {
-        self.last_frame_start = Some(now());
-    }
-    
-    fn end_frame(&mut self) -> Option<PerformanceSnapshot> {
-        if let Some(frame_start) = self.last_frame_start.take() {
-            let frame_end = now();
-            let frame_duration = frame_end - frame_start;
-            
-            // Add this frame to our rolling window
-            self.frame_times.push_back((frame_start, frame_duration));
-            self.total_frames += 1;
-            
-            // Remove frames older than 1 second for rolling calculation
-            let one_second_ago = frame_end - 1000.0; // 1 second = 1000ms
-            while let Some(&(timestamp, _)) = self.frame_times.front() {
-                if timestamp < one_second_ago {
-                    self.frame_times.pop_front();
-                } else {
-                    break;
-                }
-            }
-            
-            // Check if we should export a snapshot
-            if frame_end - self.last_export >= self.export_interval {
-                self.last_export = frame_end;
-                return Some(self.create_snapshot(frame_end));
-            }
-        }
-        None
-    }
-    
-    fn create_snapshot(&self, now: f64) -> PerformanceSnapshot {
-        if self.frame_times.is_empty() {
-            return PerformanceSnapshot {
-                timestamp: now - self.session_start,
-                fps: 0.0,
-                frame_time_ms: 0.0,
-                min_frame_time: 0.0,
-                max_frame_time: 0.0,
-                frame_count: self.total_frames,
-                camera_updates_per_sec: 0.0,
-                camera_dirty_ratio: 0.0,
-                buffer_uploads_per_sec: 0.0,
-                bytes_uploaded_per_sec: 0.0,
-                uniform_updates_per_sec: 0.0,
-                matrix_calc_time_us: 0.0,
-                buffer_upload_time_us: 0.0,
-                gpu_submit_time_us: 0.0,
-                cpu_utilization_ratio: 0.0,
-                memory_efficiency: 0.0,
-            };
-        }
-        
-        // Calculate metrics from rolling window (last 1 second)
-        let window_size = self.frame_times.len() as f64;
-        let fps = window_size; // frames in 1 second = FPS
-        
-        let durations: Vec<f64> = self.frame_times
-            .iter()
-            .map(|(_, duration)| *duration)
-            .collect();
-        
-        let avg_frame_time = durations.iter().sum::<f64>() / window_size;
-        let min_frame_time = durations.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-        let max_frame_time = durations.iter().fold(0.0f64, |a, &b| a.max(b));
-        
-        // Calculate camera update metrics
-        let one_second_ago = now - 1000.0;
-        let recent_camera_updates = self.camera_updates.iter()
-            .filter(|&&timestamp| timestamp > one_second_ago)
-            .count() as f64;
-        let camera_updates_per_sec = recent_camera_updates;
-        let camera_dirty_ratio = if window_size > 0.0 { recent_camera_updates / window_size } else { 0.0 };
-        
-        // Calculate buffer metrics
-        let recent_buffer_uploads = self.buffer_uploads.iter()
-            .filter(|(timestamp, _)| *timestamp > one_second_ago)
-            .count() as f64;
-        let total_bytes_uploaded: u32 = self.buffer_uploads.iter()
-            .filter(|(timestamp, _)| *timestamp > one_second_ago)
-            .map(|(_, bytes)| *bytes)
-            .sum();
-        let bytes_uploaded_per_sec = total_bytes_uploaded as f64;
-        
-        let recent_uniform_updates = self.uniform_updates.iter()
-            .filter(|&&timestamp| timestamp > one_second_ago)
-            .count() as f64;
-        
-        // Calculate efficiency ratios
-        let total_frame_time = avg_frame_time;
-        let cpu_time = self.current_matrix_calc_time + self.current_buffer_upload_time;
-        let cpu_utilization_ratio = if total_frame_time > 0.0 { cpu_time / total_frame_time } else { 0.0 };
-        
-        let memory_efficiency = if recent_buffer_uploads > 0.0 { 
-            recent_uniform_updates / recent_buffer_uploads 
-        } else { 
-            1.0 
-        };
-        
-        PerformanceSnapshot {
-            timestamp: now - self.session_start,
-            fps,
-            frame_time_ms: avg_frame_time,
-            min_frame_time,
-            max_frame_time,
-            frame_count: self.total_frames,
-            camera_updates_per_sec,
-            camera_dirty_ratio,
-            buffer_uploads_per_sec: recent_buffer_uploads,
-            bytes_uploaded_per_sec,
-            uniform_updates_per_sec: recent_uniform_updates,
-            matrix_calc_time_us: self.current_matrix_calc_time * 1000.0, // Convert to μs
-            buffer_upload_time_us: self.current_buffer_upload_time * 1000.0, // Convert to μs  
-            gpu_submit_time_us: self.current_gpu_submit_time * 1000.0, // Convert to μs
-            cpu_utilization_ratio,
-            memory_efficiency,
-        }
-    }
-    
-    fn track_camera_change(&mut self, distance: f32, pan_x: f32, pan_y: f32, rot_x: f32, rot_y: f32) {
-        let current_state = (distance, pan_x, pan_y, rot_x, rot_y);
-        
-        // Check if camera state actually changed  
-        if current_state != self.last_camera_state {
-            let now = now();
-            self.camera_updates.push_back(now);
-            self.last_camera_state = current_state;
-            
-            // Clean old camera updates (older than 1 second)
-            let one_second_ago = now - 1000.0;
-            while let Some(&timestamp) = self.camera_updates.front() {
-                if timestamp < one_second_ago {
-                    self.camera_updates.pop_front();
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-    
-    fn track_buffer_upload(&mut self, bytes: u32) {
-        let now = now();
-        self.buffer_uploads.push_back((now, bytes));
-        
-        // Clean old buffer uploads (older than 1 second)
-        let one_second_ago = now - 1000.0;
-        while let Some(&(timestamp, _)) = self.buffer_uploads.front() {
-            if timestamp < one_second_ago {
-                self.buffer_uploads.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-    
-    fn track_uniform_update(&mut self) {
-        let now = now();
-        self.uniform_updates.push_back(now);
-        
-        // Clean old uniform updates (older than 1 second)
-        let one_second_ago = now - 1000.0;
-        while let Some(&timestamp) = self.uniform_updates.front() {
-            if timestamp < one_second_ago {
-                self.uniform_updates.pop_front();
-            } else {
-                break;
-            }
+            position,
+            bounding_sphere: BoundingSphere::for_cube(position, size),
+            visible: true,
         }
     }
 }
@@ -357,32 +45,43 @@ pub struct CubeRenderer {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    
+    // Instance buffer for GPU instancing
+    instance_buffer: wgpu::Buffer,
+    instance_data: Vec<InstanceData>,
+    max_instances: u32,
+    
     uniforms: Uniforms,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     
-    // Camera controls
-    camera_distance: f32,
-    camera_pan_x: f32,
-    camera_pan_y: f32,
-    camera_rotation_x: f32, // Pitch (up/down rotation)
-    camera_rotation_y: f32, // Yaw (left/right rotation)
+    // Depth buffer for 3D rendering
+    depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    
+    // Camera system
+    camera: Camera,
     
     // Dirty tracking for optimization
     uniforms_dirty: bool,
     
-    // Matrix caching for performance
-    cached_projection_matrix: cgmath::Matrix4<f32>,
-    cached_view_matrix: cgmath::Matrix4<f32>,
-    cached_view_proj_matrix: cgmath::Matrix4<f32>,
-    projection_dirty: bool,
-    view_dirty: bool,
+    // Command buffer optimization - cache descriptors
+    command_encoder_desc: wgpu::CommandEncoderDescriptor<'static>,
+    texture_view_desc: wgpu::TextureViewDescriptor<'static>,
     
     // Background color
     background_color: wgpu::Color,
     
     // Performance tracking
     performance_tracker: PerformanceTracker,
+    
+    // Objects to render (for frustum culling demonstration)
+    objects: Vec<RenderableObject>,
+    
+    // Frustum culling state
+    current_frustum: Option<Frustum>,
+    visible_objects: u32,
+    total_objects: u32,
 }
 
 #[wasm_bindgen]
@@ -486,7 +185,9 @@ impl CubeRenderer {
             }
         };
 
-        Self::create_with_adapter_and_surface(adapter, surface, width, height, bg_color).await
+        let result = Self::create_with_adapter_and_surface(adapter, surface, width, height, bg_color).await?;
+        
+        Ok(result)
     }
 
     async fn create_webgl_renderer(
@@ -640,7 +341,7 @@ impl CubeRenderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
+                buffers: &[Vertex::desc(), InstanceData::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -662,7 +363,13 @@ impl CubeRenderer {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -686,8 +393,38 @@ impl CubeRenderer {
         let num_indices = INDICES.len() as u32;
 
         console::log_1(&"🎉 CubeRenderer created successfully!".into());
+        
+        // Maximum number of instances for GPU instancing
+        let max_instances = 10000u32;
+        
+        // Create instance buffer for GPU instancing
+        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Instance Buffer"),
+            size: (std::mem::size_of::<InstanceData>() * max_instances as usize) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        Ok(Self {
+        // Create depth texture for 3D rendering
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Create the renderer instance
+        let mut renderer = Self {
             surface,
             device,
             queue,
@@ -701,20 +438,35 @@ impl CubeRenderer {
             uniforms,
             uniform_buffer,
             uniform_bind_group,
-            camera_distance: 5.0,
-            camera_pan_x: 0.0,
-            camera_pan_y: 0.0,
-            camera_rotation_x: 0.0,
-            camera_rotation_y: 0.0,
+            camera: Camera::new(width, height),
             background_color: bg_color,
             performance_tracker: PerformanceTracker::new(),
+            command_encoder_desc: wgpu::CommandEncoderDescriptor {
+                label: None,
+                ..Default::default()
+            },
+            texture_view_desc: wgpu::TextureViewDescriptor::default(),
             uniforms_dirty: true,
-            cached_projection_matrix: cgmath::Matrix4::identity(),
-            cached_view_matrix: cgmath::Matrix4::identity(),
-            cached_view_proj_matrix: cgmath::Matrix4::identity(),
-            projection_dirty: true,
-            view_dirty: true,
-        })
+            depth_texture,
+            depth_view,
+            objects: Vec::new(),
+            current_frustum: None,
+            visible_objects: 0,
+            total_objects: 0,
+            instance_buffer,
+            instance_data: Vec::new(),
+            max_instances,
+        };
+        
+        // Create a default cube at the origin using the proper instancing system
+        let default_position = Point3::new(0.0, 0.0, 0.0);
+        let default_object = RenderableObject::new(default_position, 0.5); // Much smaller default size
+        renderer.objects.push(default_object);
+        renderer.total_objects = 1;
+        
+        console::log_1(&"🎯 Default cube created using instancing system".into());
+        
+        Ok(renderer)
     }
 
     #[wasm_bindgen]
@@ -726,8 +478,26 @@ impl CubeRenderer {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
             
-            // Mark projection matrix as dirty (resize)  
-            self.mark_projection_dirty();
+            // Recreate depth buffer for new size
+            self.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Depth Texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            
+            // Update camera dimensions and mark matrices as dirty
+            self.camera.resize(width, height);
+            self.uniforms_dirty = true;
             
             console::log_1(&format!("Resized canvas to width: {}, height: {}", width, height).into());
         }
@@ -735,121 +505,51 @@ impl CubeRenderer {
 
     #[wasm_bindgen]
     pub fn zoom(&mut self, delta: f32) {
-        // Zoom by adjusting camera distance
-        // Positive delta = zoom in (get closer), negative = zoom out (get farther)
-        let zoom_sensitivity = 0.1;
-        let zoom_factor = 1.0 + (delta * zoom_sensitivity);
-        
-        self.camera_distance /= zoom_factor;
-        
-        // Clamp camera distance to reasonable bounds
-        self.camera_distance = self.camera_distance.clamp(1.0, 50.0);
-        
-        // Mark view matrix as dirty (camera changed)
-        self.mark_view_dirty();
+        self.camera.zoom(delta);
+        self.uniforms_dirty = true;
     }
 
     #[wasm_bindgen]
     pub fn pan(&mut self, delta_x: f32, delta_y: f32) {
-        // Pan by adjusting the target position
-        // Scale pan sensitivity based on camera distance (further = larger pan movements)
-        let pan_sensitivity = 0.001 * self.camera_distance;
-        
-        // Invert deltaX and deltaY so dragging feels like moving the object directly
-        self.camera_pan_x -= delta_x * pan_sensitivity; // Invert X for natural movement
-        self.camera_pan_y += delta_y * pan_sensitivity; // Invert Y for natural movement
-        
-        // Mark view matrix as dirty (camera changed)
-        self.mark_view_dirty();
+        self.camera.pan(delta_x, delta_y);
+        self.uniforms_dirty = true;
     }
 
     #[wasm_bindgen]
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
-        // Rotate camera around target (orbital rotation)
-        let rotation_sensitivity = 0.001;
-        
-        // Invert deltas so dragging feels like rotating the object directly
-        self.camera_rotation_y -= delta_x * rotation_sensitivity; // Invert Yaw for natural rotation
-        self.camera_rotation_x -= delta_y * rotation_sensitivity; // Invert Pitch for natural rotation
-        
-        // Clamp pitch to prevent gimbal lock
-        self.camera_rotation_x = self.camera_rotation_x.clamp(-1.5, 1.5);
-        
-        // Mark view matrix as dirty (camera changed)
-        self.mark_view_dirty();
+        self.camera.rotate(delta_x, delta_y);
+        self.uniforms_dirty = true;
     }
     
-    // Helper method to mark view matrix as dirty (camera changed)
-    fn mark_view_dirty(&mut self) {
-        self.view_dirty = true;
-        self.uniforms_dirty = true; // Combined matrix will need updating too
-    }
-    
-    // Helper method to mark projection matrix as dirty (resize)  
-    fn mark_projection_dirty(&mut self) {
-        self.projection_dirty = true;
-        self.uniforms_dirty = true; // Combined matrix will need updating too
-    }
-
     #[wasm_bindgen]
     pub fn render(&mut self) -> Result<(), JsValue> {
         // Start performance tracking for this frame
         self.performance_tracker.start_frame();
         
         // Track camera state changes for performance metrics
+        let camera_state = self.camera.get_state();
         self.performance_tracker.track_camera_change(
-            self.camera_distance,
-            self.camera_pan_x,
-            self.camera_pan_y,
-            self.camera_rotation_x,
-            self.camera_rotation_y,
+            camera_state.0, camera_state.1, camera_state.2, camera_state.3, camera_state.4
         );
         
         // Only recalculate matrices and update uniforms if camera changed
         if self.uniforms_dirty {
-            // Time matrix calculations
-            let matrix_start = now();
+            // Get the view-projection matrix from camera (with timing)
+            let matrix_calc_time = if self.camera.is_dirty() {
+                self.camera.update_matrices()
+            } else {
+                0.0
+            };
             
-            // Recalculate projection matrix only if it's dirty (resize)
-            if self.projection_dirty {
-                let aspect = self.width as f32 / self.height as f32;
-                self.cached_projection_matrix = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
-                self.projection_dirty = false;
-            }
+            // Update uniforms with the combined matrix
+            let view_proj_matrix = self.camera.get_view_proj_matrix();
+            self.uniforms.update_view_proj(view_proj_matrix);
             
-            // Recalculate view matrix only if it's dirty (camera moved)
-            if self.view_dirty {
-                // Create orbital camera system
-                // 1. Apply rotations around the target
-                let rotation_y = cgmath::Matrix4::from_angle_y(cgmath::Rad(self.camera_rotation_y));
-                let rotation_x = cgmath::Matrix4::from_angle_x(cgmath::Rad(self.camera_rotation_x));
-                let rotation_matrix = rotation_y * rotation_x;
-                
-                // 2. Position camera at distance from target
-                let camera_offset = cgmath::Vector3::new(0.0, 0.0, self.camera_distance);
-                let rotated_offset = rotation_matrix.transform_vector(camera_offset);
-                
-                // 3. Apply pan offset to target position
-                let target = cgmath::Point3::new(self.camera_pan_x, self.camera_pan_y, 0.0);
-                let camera_position = target + rotated_offset;
-                
-                // 4. Create view matrix
-                self.cached_view_matrix = cgmath::Matrix4::look_at_rh(
-                    camera_position,
-                    target,
-                    cgmath::Vector3::unit_y(),
-                );
-                self.view_dirty = false;
-            }
-
-            // Combine cached matrices (this is very fast since matrices are already calculated)
-            let model = cgmath::Matrix4::identity(); // Static model matrix
-            self.cached_view_proj_matrix = self.cached_projection_matrix * self.cached_view_matrix * model;
-            self.uniforms.update_view_proj(self.cached_view_proj_matrix);
+            // Extract frustum for culling
+            self.current_frustum = Some(Frustum::from_view_proj_matrix(view_proj_matrix));
             
             // Record matrix calculation time
-            let matrix_end = now();
-            self.performance_tracker.current_matrix_calc_time = matrix_end - matrix_start;
+            self.performance_tracker.current_matrix_calc_time = matrix_calc_time;
 
             // Time buffer upload
             let buffer_start = now();
@@ -875,6 +575,12 @@ impl CubeRenderer {
             self.performance_tracker.current_buffer_upload_time = 0.0;
         }
 
+        // Perform frustum culling on objects
+        self.perform_frustum_culling();
+        
+        // Update instance data for GPU instancing (only visible objects)
+        self.update_instance_data();
+
         // Time GPU submission (this always happens)
         let gpu_start = now();
 
@@ -884,17 +590,18 @@ impl CubeRenderer {
 
         let view = output
             .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .create_view(&self.texture_view_desc);
 
+        // Use cached command encoder descriptor for optimization
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
+            .create_command_encoder(&self.command_encoder_desc);
 
+        // Optimized render pass setup with minimal allocations
         {
+            // Create render pass with inline descriptor to avoid allocation
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: None, // Skip label in release builds for performance
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -903,18 +610,33 @@ impl CubeRenderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
 
+            // Batch render pass operations for efficiency
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            
+            // Use instanced drawing - render all visible objects in a single draw call
+            let instance_count = self.instance_data.len() as u32;
+            if instance_count > 0 {
+                render_pass.draw_indexed(0..self.num_indices, 0, 0..instance_count);
+            }
         }
 
+        // Submit command buffer
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
@@ -933,11 +655,158 @@ impl CubeRenderer {
     pub fn get_performance_snapshot(&mut self) -> Option<PerformanceSnapshot> {
         // Force create a snapshot for JavaScript to consume
         // This is called periodically from JavaScript, not every frame
-        if !self.performance_tracker.frame_times.is_empty() {
+        if self.performance_tracker.has_frames() {
             let now = now();
             Some(self.performance_tracker.create_snapshot(now))
         } else {
             None
         }
+    }
+
+    #[wasm_bindgen]
+    pub fn get_visible_objects(&self) -> u32 {
+        self.visible_objects
+    }
+    
+    #[wasm_bindgen]
+    pub fn get_total_objects(&self) -> u32 {
+        self.total_objects
+    }
+    
+    #[wasm_bindgen]
+    pub fn get_culling_ratio(&self) -> f32 {
+        if self.total_objects > 0 {
+            (self.total_objects - self.visible_objects) as f32 / self.total_objects as f32
+        } else {
+            0.0
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn create_test_objects(&mut self, count: u32) {
+        self.objects.clear();
+        
+        // Create a grid of cubes for testing frustum culling
+        let grid_size = (count as f32).cbrt().ceil() as i32;
+        let spacing = 3.0;
+        let offset = (grid_size as f32 - 1.0) * spacing * 0.5;
+        
+        for x in 0..grid_size {
+            for y in 0..grid_size {
+                for z in 0..grid_size {
+                    if self.objects.len() >= count as usize {
+                        break;
+                    }
+                    
+                    let position = Point3::new(
+                        x as f32 * spacing - offset,
+                        y as f32 * spacing - offset,
+                        z as f32 * spacing - offset,
+                    );
+                    
+                    self.objects.push(RenderableObject::new(position, 2.0));
+                }
+                if self.objects.len() >= count as usize {
+                    break;
+                }
+            }
+            if self.objects.len() >= count as usize {
+                break;
+            }
+        }
+        
+        self.total_objects = self.objects.len() as u32;
+        console::log_1(&format!("Created {} test objects for frustum culling", self.total_objects).into());
+    }
+    
+    fn perform_frustum_culling(&mut self) {
+        if let Some(ref frustum) = self.current_frustum {
+            self.visible_objects = 0;
+            
+            for object in &mut self.objects {
+                object.visible = frustum.contains_sphere(
+                    object.bounding_sphere.center,
+                    object.bounding_sphere.radius,
+                );
+                
+                if object.visible {
+                    self.visible_objects += 1;
+                }
+            }
+        } else {
+            // No frustum available, mark all as visible
+            self.visible_objects = self.total_objects;
+            for object in &mut self.objects {
+                object.visible = true;
+            }
+        }
+    }
+
+    fn update_instance_data(&mut self) {
+        // Clear previous instance data
+        self.instance_data.clear();
+        
+        // Populate instance data from visible objects only
+        for object in &self.objects {
+            if object.visible {
+                let color = if object.position.x == 0.0 && object.position.y == 0.0 && object.position.z == 0.0 {
+                    // Default cube at origin gets beautiful purple-pink color
+                    [0.8, 0.2, 0.8]
+                } else {
+                    // Other objects get height-based coloring
+                    match object.position.y {
+                        y if y > 2.0 => [1.0, 0.2, 0.2], // Red for high objects
+                        y if y < -2.0 => [0.2, 0.2, 1.0], // Blue for low objects
+                        _ => [0.2, 1.0, 0.2], // Green for middle objects
+                    }
+                };
+                
+                self.instance_data.push(InstanceData::new(
+                    [object.position.x, object.position.y, object.position.z],
+                    color,
+                    object.bounding_sphere.radius,
+                ));
+            }
+        }
+        
+        // Update instance buffer if we have data
+        if !self.instance_data.is_empty() {
+            let byte_data = bytemuck::cast_slice(&self.instance_data);
+            self.queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                byte_data,
+            );
+        }
+    }
+
+    #[wasm_bindgen]
+    pub fn add_object(&mut self, x: f32, y: f32, z: f32, radius: f32) {
+        let position = Point3::new(x, y, z);
+        let object = RenderableObject::new(position, radius * 2.0); // size = diameter
+        self.objects.push(object);
+        self.total_objects = self.objects.len() as u32;
+    }
+    
+    #[wasm_bindgen]
+    pub fn enable_instancing_demo(&mut self) {
+        // Create a small grid of colorful cubes to demonstrate instancing
+        self.objects.clear();
+        
+        for x in -1..=1 {
+            for y in -1..=1 {
+                for z in -1..=1 {
+                    let position = Point3::new(
+                        x as f32 * 4.0,
+                        y as f32 * 4.0,
+                        z as f32 * 4.0,
+                    );
+                    self.objects.push(RenderableObject::new(position, 1.5));
+                }
+            }
+        }
+        
+        self.total_objects = self.objects.len() as u32;
+        console::log_1(&format!("🎨 Instancing demo enabled with {} objects", self.total_objects).into());
     }
 } 

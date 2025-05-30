@@ -12,6 +12,12 @@ struct VertexInput {
     @location(1) color: vec3<f32>,
 }
 
+struct InstanceInput {
+    @location(2) instance_position: vec3<f32>,
+    @location(3) instance_color: vec3<f32>,
+    @location(4) instance_scale: f32,
+}
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
@@ -20,10 +26,26 @@ struct VertexOutput {
 @vertex
 fn vs_main(
     model: VertexInput,
+    instance: InstanceInput,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.color = model.color;
-    out.clip_position = uniforms.view_proj * vec4<f32>(model.position, 1.0);
+    
+    // Use vertex color to choose between purple and pink faces
+    if (model.color.r > 0.5) {
+        // Red vertex (front face) -> Purple
+        out.color = vec3<f32>(0.6, 0.2, 0.8); // Purple
+    } else if (model.color.g > 0.5) {
+        // Green vertex (back face) -> Pink
+        out.color = vec3<f32>(1.0, 0.4, 0.7); // Pink
+    } else {
+        // Other faces -> Mix of purple and pink
+        out.color = vec3<f32>(0.8, 0.3, 0.9); // Light purple-pink
+    }
+    
+    // Scale vertex position by instance scale, then translate by instance position
+    let world_position = (model.position * instance.instance_scale) + instance.instance_position;
+    out.clip_position = uniforms.view_proj * vec4<f32>(world_position, 1.0);
+    
     return out;
 }
 
