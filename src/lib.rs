@@ -371,6 +371,13 @@ pub struct CubeRenderer {
     // Dirty tracking for optimization
     uniforms_dirty: bool,
     
+    // Matrix caching for performance
+    cached_projection_matrix: cgmath::Matrix4<f32>,
+    cached_view_matrix: cgmath::Matrix4<f32>,
+    cached_view_proj_matrix: cgmath::Matrix4<f32>,
+    projection_dirty: bool,
+    view_dirty: bool,
+    
     // Background color
     background_color: wgpu::Color,
     
@@ -702,6 +709,11 @@ impl CubeRenderer {
             background_color: bg_color,
             performance_tracker: PerformanceTracker::new(),
             uniforms_dirty: true,
+            cached_projection_matrix: cgmath::Matrix4::identity(),
+            cached_view_matrix: cgmath::Matrix4::identity(),
+            cached_view_proj_matrix: cgmath::Matrix4::identity(),
+            projection_dirty: true,
+            view_dirty: true,
         })
     }
 
@@ -714,8 +726,8 @@ impl CubeRenderer {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
             
-            // Mark uniforms dirty since aspect ratio changed
-            self.mark_uniforms_dirty();
+            // Mark projection matrix as dirty (resize)  
+            self.mark_projection_dirty();
             
             console::log_1(&format!("Resized canvas to width: {}, height: {}", width, height).into());
         }
@@ -733,8 +745,8 @@ impl CubeRenderer {
         // Clamp camera distance to reasonable bounds
         self.camera_distance = self.camera_distance.clamp(1.0, 50.0);
         
-        // Mark uniforms dirty since camera changed
-        self.mark_uniforms_dirty();
+        // Mark view matrix as dirty (camera changed)
+        self.mark_view_dirty();
     }
 
     #[wasm_bindgen]
@@ -747,8 +759,8 @@ impl CubeRenderer {
         self.camera_pan_x -= delta_x * pan_sensitivity; // Invert X for natural movement
         self.camera_pan_y += delta_y * pan_sensitivity; // Invert Y for natural movement
         
-        // Mark uniforms dirty since camera changed
-        self.mark_uniforms_dirty();
+        // Mark view matrix as dirty (camera changed)
+        self.mark_view_dirty();
     }
 
     #[wasm_bindgen]
@@ -763,13 +775,20 @@ impl CubeRenderer {
         // Clamp pitch to prevent gimbal lock
         self.camera_rotation_x = self.camera_rotation_x.clamp(-1.5, 1.5);
         
-        // Mark uniforms dirty since camera changed
-        self.mark_uniforms_dirty();
+        // Mark view matrix as dirty (camera changed)
+        self.mark_view_dirty();
     }
     
-    // Helper method to mark uniforms as dirty
-    fn mark_uniforms_dirty(&mut self) {
-        self.uniforms_dirty = true;
+    // Helper method to mark view matrix as dirty (camera changed)
+    fn mark_view_dirty(&mut self) {
+        self.view_dirty = true;
+        self.uniforms_dirty = true; // Combined matrix will need updating too
+    }
+    
+    // Helper method to mark projection matrix as dirty (resize)  
+    fn mark_projection_dirty(&mut self) {
+        self.projection_dirty = true;
+        self.uniforms_dirty = true; // Combined matrix will need updating too
     }
 
     #[wasm_bindgen]
@@ -791,36 +810,42 @@ impl CubeRenderer {
             // Time matrix calculations
             let matrix_start = now();
             
-            // Create transformation matrices
-            let aspect = self.width as f32 / self.height as f32;
-            let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
+            // Recalculate projection matrix only if it's dirty (resize)
+            if self.projection_dirty {
+                let aspect = self.width as f32 / self.height as f32;
+                self.cached_projection_matrix = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
+                self.projection_dirty = false;
+            }
             
-            // Create orbital camera system
-            // 1. Apply rotations around the target
-            let rotation_y = cgmath::Matrix4::from_angle_y(cgmath::Rad(self.camera_rotation_y));
-            let rotation_x = cgmath::Matrix4::from_angle_x(cgmath::Rad(self.camera_rotation_x));
-            let rotation_matrix = rotation_y * rotation_x;
-            
-            // 2. Position camera at distance from target
-            let camera_offset = cgmath::Vector3::new(0.0, 0.0, self.camera_distance);
-            let rotated_offset = rotation_matrix.transform_vector(camera_offset);
-            
-            // 3. Apply pan offset to target position
-            let target = cgmath::Point3::new(self.camera_pan_x, self.camera_pan_y, 0.0);
-            let camera_position = target + rotated_offset;
-            
-            // 4. Create view matrix
-            let view = cgmath::Matrix4::look_at_rh(
-                camera_position,
-                target,
-                cgmath::Vector3::unit_y(),
-            );
+            // Recalculate view matrix only if it's dirty (camera moved)
+            if self.view_dirty {
+                // Create orbital camera system
+                // 1. Apply rotations around the target
+                let rotation_y = cgmath::Matrix4::from_angle_y(cgmath::Rad(self.camera_rotation_y));
+                let rotation_x = cgmath::Matrix4::from_angle_x(cgmath::Rad(self.camera_rotation_x));
+                let rotation_matrix = rotation_y * rotation_x;
+                
+                // 2. Position camera at distance from target
+                let camera_offset = cgmath::Vector3::new(0.0, 0.0, self.camera_distance);
+                let rotated_offset = rotation_matrix.transform_vector(camera_offset);
+                
+                // 3. Apply pan offset to target position
+                let target = cgmath::Point3::new(self.camera_pan_x, self.camera_pan_y, 0.0);
+                let camera_position = target + rotated_offset;
+                
+                // 4. Create view matrix
+                self.cached_view_matrix = cgmath::Matrix4::look_at_rh(
+                    camera_position,
+                    target,
+                    cgmath::Vector3::unit_y(),
+                );
+                self.view_dirty = false;
+            }
 
-            // Static model matrix (object stays at origin)
-            let model = cgmath::Matrix4::identity();
-
-            let view_proj = proj * view * model;
-            self.uniforms.update_view_proj(view_proj);
+            // Combine cached matrices (this is very fast since matrices are already calculated)
+            let model = cgmath::Matrix4::identity(); // Static model matrix
+            self.cached_view_proj_matrix = self.cached_projection_matrix * self.cached_view_matrix * model;
+            self.uniforms.update_view_proj(self.cached_view_proj_matrix);
             
             // Record matrix calculation time
             let matrix_end = now();
