@@ -82,6 +82,12 @@ pub struct CubeRenderer {
     current_frustum: Option<Frustum>,
     visible_objects: u32,
     total_objects: u32,
+    
+    // Cached geometry metrics (updated only on scene changes)
+    cached_object_count: u32,
+    cached_edge_count: u32,
+    cached_vertex_count: u32,
+    cached_index_count: u32,
 }
 
 #[wasm_bindgen]
@@ -425,7 +431,7 @@ impl CubeRenderer {
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create the renderer instance
-        let mut renderer = Self {
+        let renderer = Self {
             surface,
             device,
             queue,
@@ -457,6 +463,10 @@ impl CubeRenderer {
             instance_buffer,
             instance_data: Vec::new(),
             max_instances,
+            cached_object_count: 0,
+            cached_edge_count: 0,
+            cached_vertex_count: 0,
+            cached_index_count: 0,
         };
         
         console::log_1(&"🎯 Renderer created with clean state (no default objects)".into());
@@ -652,7 +662,20 @@ impl CubeRenderer {
         // This is called periodically from JavaScript, not every frame
         if self.performance_tracker.has_frames() {
             let now = now();
-            Some(self.performance_tracker.create_snapshot(now))
+            let snapshot = self.performance_tracker.create_snapshot_with_renderer_data(
+                now,
+                self.cached_object_count,
+                self.cached_edge_count,
+                self.cached_vertex_count,
+                self.cached_index_count,
+                self.calculate_current_memory_usage(),
+                self.calculate_scene_size_memory_bytes(),
+                self.calculate_active_view_memory_bytes(),
+                self.visible_objects,
+                VERTICES.len(),
+            );
+            
+            Some(snapshot)
         } else {
             None
         }
@@ -781,6 +804,9 @@ impl CubeRenderer {
         let object = RenderableObject::new(position, radius * 2.0); // size = diameter
         self.objects.push(object);
         self.total_objects = self.objects.len() as u32;
+        
+        // Update cached geometry metrics after scene change
+        self.update_geometry_metrics();
     }
     
     #[wasm_bindgen]
@@ -795,7 +821,7 @@ impl CubeRenderer {
         
         // Check if we exceed our buffer capacity
         if total_cubes > self.max_instances as u64 {
-            let max_grid_size = ((self.max_instances as f64).cbrt().floor() as u32);
+            let max_grid_size = (self.max_instances as f64).cbrt().floor() as u32;
             console::log_1(&format!("❌ ERROR: {}x{}x{} grid needs {} cubes, but buffer supports max {} cubes", 
                 grid_size, grid_size, grid_size, total_cubes, self.max_instances).into());
             console::log_1(&format!("📏 Maximum supported grid size: {}x{}x{} = {} cubes", 
@@ -847,6 +873,74 @@ impl CubeRenderer {
         let total_spread = grid_size as f32 * cube_diameter;
         console::log_1(&format!("🎨 Instancing demo: {}x{}x{} grid = {} cubes (cube_diameter: {:.3}, cube_radius: {:.3}, total_spread: {:.3})", 
             grid_size, grid_size, grid_size, self.total_objects, cube_diameter, cube_size, total_spread).into());
+        
+        // Update cached geometry metrics after scene change
+        self.update_geometry_metrics();
     }
     
+    // Update cached geometry metrics - call only when scene changes
+    fn update_geometry_metrics(&mut self) {
+        self.cached_object_count = self.objects.len() as u32;
+        
+        // For current cube-based system
+        if !self.objects.is_empty() {
+            self.cached_vertex_count = (self.objects.len() as u32) * (VERTICES.len() as u32);
+            self.cached_index_count = (self.objects.len() as u32) * (INDICES.len() as u32);
+            self.cached_edge_count = (self.objects.len() as u32) * 12; // 12 edges per cube
+        } else {
+            self.cached_vertex_count = 0;
+            self.cached_index_count = 0; 
+            self.cached_edge_count = 0;
+        }
+        
+        console::log_1(&format!("📐 Geometry metrics updated: {} objects, {} vertices, {} indices, {} edges", 
+            self.cached_object_count, self.cached_vertex_count, self.cached_index_count, self.cached_edge_count).into());
+    }
+    
+    // Calculate current GPU memory usage in bytes
+    fn calculate_current_memory_usage(&self) -> u64 {
+        let vertex_buffer_size = std::mem::size_of_val(VERTICES) as u64;
+        let index_buffer_size = std::mem::size_of_val(INDICES) as u64;
+        let instance_buffer_size = (std::mem::size_of::<InstanceData>() * self.max_instances as usize) as u64;
+        let uniform_buffer_size = std::mem::size_of::<Uniforms>() as u64;
+        let depth_texture_size = (self.width * self.height * 4) as u64; // 32-bit depth = 4 bytes per pixel
+        
+        vertex_buffer_size + index_buffer_size + instance_buffer_size + uniform_buffer_size + depth_texture_size
+    }
+    
+    // Calculate total scene memory (all objects, regardless of visibility)
+    fn calculate_scene_size_memory_bytes(&self) -> u64 {
+        if self.total_objects == 0 {
+            return 0;
+        }
+        
+        // Per-object memory calculation
+        let instance_data_per_object = std::mem::size_of::<InstanceData>() as u64;
+        
+        // The vertex and index buffers are shared across all objects, so we only scale instance data
+        let shared_geometry_memory = std::mem::size_of_val(VERTICES) as u64 + std::mem::size_of_val(INDICES) as u64;
+        let instance_memory = (self.total_objects as u64) * instance_data_per_object;
+        
+        shared_geometry_memory + instance_memory
+    }
+    
+    // Calculate active view memory (visible objects only, post-culling)
+    fn calculate_active_view_memory_bytes(&self) -> u64 {
+        if self.visible_objects == 0 {
+            return 0;
+        }
+        
+        // Per-visible-object memory calculation
+        let instance_data_per_object = std::mem::size_of::<InstanceData>() as u64;
+        
+        // The vertex and index buffers are still shared, but we only count visible instance data
+        let shared_geometry_memory = if self.visible_objects > 0 { 
+            std::mem::size_of_val(VERTICES) as u64 + std::mem::size_of_val(INDICES) as u64 
+        } else { 
+            0 
+        };
+        let visible_instance_memory = (self.visible_objects as u64) * instance_data_per_object;
+        
+        shared_geometry_memory + visible_instance_memory
+    }
 } 

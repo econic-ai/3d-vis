@@ -41,6 +41,21 @@ pub struct PerformanceSnapshot {
     // Efficiency ratios
     pub cpu_utilization_ratio: f64,     // CPU work / total frame time
     pub memory_efficiency: f64,         // Useful uploads / total uploads
+    
+    // Geometry metrics (cached, updated only on scene changes)
+    pub object_count: u32,              // Total objects in scene
+    pub edge_count: u32,                // Total edges in scene
+    pub vertex_count: u32,              // Total vertices in scene template
+    pub index_count: u32,               // Total indices for all objects
+    
+    // Memory and GPU throughput
+    pub memory_usage_mb: f64,           // Current GPU memory usage in MB
+    pub gpu_vertices_per_sec: f64,      // Actual GPU vertex processing (visible only)
+    
+    // New memory breakdown metrics
+    pub scene_size_memory_mb: f64,      // Total memory for all objects in scene
+    pub active_view_memory_mb: f64,     // Memory for currently visible objects (post-culling)
+    pub active_memory_throughput_mb_per_sec: f64, // Memory transfer rate for visible objects
 }
 
 pub struct PerformanceTracker {
@@ -144,6 +159,15 @@ impl PerformanceTracker {
                 gpu_submit_time_us: 0.0,
                 cpu_utilization_ratio: 0.0,
                 memory_efficiency: 0.0,
+                object_count: 0,
+                edge_count: 0,
+                vertex_count: 0,
+                index_count: 0,
+                memory_usage_mb: 0.0,
+                gpu_vertices_per_sec: 0.0,
+                scene_size_memory_mb: 0.0,
+                active_view_memory_mb: 0.0,
+                active_memory_throughput_mb_per_sec: 0.0,
             };
         }
         
@@ -210,7 +234,61 @@ impl PerformanceTracker {
             gpu_submit_time_us: self.current_gpu_submit_time * 1000.0, // Convert to μs
             cpu_utilization_ratio,
             memory_efficiency,
+            object_count: 0,
+            edge_count: 0,
+            vertex_count: 0,
+            index_count: 0,
+            memory_usage_mb: 0.0,
+            gpu_vertices_per_sec: 0.0,
+            scene_size_memory_mb: 0.0,
+            active_view_memory_mb: 0.0,
+            active_memory_throughput_mb_per_sec: 0.0,
         }
+    }
+    
+    // Enhanced create_snapshot that accepts renderer data for complete metrics
+    pub fn create_snapshot_with_renderer_data(
+        &self, 
+        now: f64,
+        cached_object_count: u32,
+        cached_edge_count: u32,
+        cached_vertex_count: u32,
+        cached_index_count: u32,
+        total_memory_usage_bytes: u64,
+        scene_size_memory_bytes: u64,
+        active_view_memory_bytes: u64,
+        visible_objects: u32,
+        vertices_per_object: usize,
+    ) -> PerformanceSnapshot {
+        // Get base snapshot with standard performance metrics
+        let mut snapshot = self.create_snapshot(now);
+        
+        // Add cached geometry metrics
+        snapshot.object_count = cached_object_count;
+        snapshot.edge_count = cached_edge_count;
+        snapshot.vertex_count = cached_vertex_count;
+        snapshot.index_count = cached_index_count;
+        
+        // Calculate memory metrics in MB
+        snapshot.memory_usage_mb = total_memory_usage_bytes as f64 / (1024.0 * 1024.0);
+        snapshot.scene_size_memory_mb = scene_size_memory_bytes as f64 / (1024.0 * 1024.0);
+        snapshot.active_view_memory_mb = active_view_memory_bytes as f64 / (1024.0 * 1024.0);
+        
+        // Calculate GPU vertices per second (only visible vertices that GPU actually processes)
+        snapshot.gpu_vertices_per_sec = (visible_objects as f64) * (vertices_per_object as f64) * snapshot.fps;
+        
+        // Calculate active memory throughput (MB/s for visible objects)
+        if visible_objects > 0 && snapshot.fps > 0.0 {
+            // Calculate bytes per frame for visible objects (instance data size per object)
+            let bytes_per_visible_object = 32.0; // InstanceData is ~32 bytes (position + color + scale)
+            let bytes_per_frame = (visible_objects as f64) * bytes_per_visible_object;
+            let bytes_per_second = bytes_per_frame * snapshot.fps;
+            snapshot.active_memory_throughput_mb_per_sec = bytes_per_second / (1024.0 * 1024.0);
+        } else {
+            snapshot.active_memory_throughput_mb_per_sec = 0.0;
+        }
+        
+        snapshot
     }
     
     pub fn track_camera_change(&mut self, distance: f32, pan_x: f32, pan_y: f32, rot_x: f32, rot_y: f32) {
