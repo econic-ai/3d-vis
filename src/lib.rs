@@ -394,8 +394,9 @@ impl CubeRenderer {
 
         console::log_1(&"🎉 CubeRenderer created successfully!".into());
         
-        // Maximum number of instances for GPU instancing
-        let max_instances = 10000u32;
+        // Maximum number of instances for GPU instancing - support up to 8M cubes
+        // Note: 8M instances * ~32 bytes per instance = ~256MB GPU buffer
+        let max_instances = 8000000u32;
         
         // Create instance buffer for GPU instancing
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -458,13 +459,7 @@ impl CubeRenderer {
             max_instances,
         };
         
-        // Create a default cube at the origin using the proper instancing system
-        let default_position = Point3::new(0.0, 0.0, 0.0);
-        let default_object = RenderableObject::new(default_position, 0.5); // Much smaller default size
-        renderer.objects.push(default_object);
-        renderer.total_objects = 1;
-        
-        console::log_1(&"🎯 Default cube created using instancing system".into());
+        console::log_1(&"🎯 Renderer created with clean state (no default objects)".into());
         
         Ok(renderer)
     }
@@ -789,24 +784,69 @@ impl CubeRenderer {
     }
     
     #[wasm_bindgen]
-    pub fn enable_instancing_demo(&mut self) {
-        // Create a small grid of colorful cubes to demonstrate instancing
+    pub fn enable_instancing_demo_with_size(&mut self, grid_size: u32) {
+        // Create a grid of colorful cubes to demonstrate instancing
         self.objects.clear();
         
-        for x in -1..=1 {
-            for y in -1..=1 {
-                for z in -1..=1 {
-                    let position = Point3::new(
-                        x as f32 * 4.0,
-                        y as f32 * 4.0,
-                        z as f32 * 4.0,
-                    );
-                    self.objects.push(RenderableObject::new(position, 1.5));
+        let grid_size = grid_size as i32;
+        
+        // Calculate total number of cubes needed
+        let total_cubes = (grid_size as u64).pow(3);
+        
+        // Check if we exceed our buffer capacity
+        if total_cubes > self.max_instances as u64 {
+            let max_grid_size = ((self.max_instances as f64).cbrt().floor() as u32);
+            console::log_1(&format!("❌ ERROR: {}x{}x{} grid needs {} cubes, but buffer supports max {} cubes", 
+                grid_size, grid_size, grid_size, total_cubes, self.max_instances).into());
+            console::log_1(&format!("📏 Maximum supported grid size: {}x{}x{} = {} cubes", 
+                max_grid_size, max_grid_size, max_grid_size, max_grid_size.pow(3)).into());
+            
+            // Fall back to maximum safe grid size
+            let safe_grid_size = max_grid_size as i32;
+            console::log_1(&format!("🔧 Using safe grid size: {}x{}x{}", safe_grid_size, safe_grid_size, safe_grid_size).into());
+            self.enable_instancing_demo_with_size(safe_grid_size as u32);
+            return;
+        }
+        
+        // Simple logic: total space is always 1.0 unit
+        // For N cubes along an axis: each cube diameter = 1.0/N
+        let cube_diameter = 1.0f32 / grid_size as f32;
+        let cube_size = cube_diameter / 2.0f32; // radius = diameter / 2
+        
+        // Spacing between cube centers = cube diameter (touching cubes, no gaps)
+        let spacing = cube_diameter + cube_size * 3.0f32;
+        
+        // Create grid positions centered around origin
+        for i in 0..grid_size {
+            for j in 0..grid_size {
+                for k in 0..grid_size {
+                    // Convert grid indices to centered positions
+                    let x = if grid_size == 1 {
+                        0.0f32 // Single cube at origin
+                    } else {
+                        (i as f32 - (grid_size as f32 - 1.0f32) / 2.0f32) * spacing
+                    };
+                    let y = if grid_size == 1 {
+                        0.0f32
+                    } else {
+                        (j as f32 - (grid_size as f32 - 1.0f32) / 2.0f32) * spacing
+                    };
+                    let z = if grid_size == 1 {
+                        0.0f32
+                    } else {
+                        (k as f32 - (grid_size as f32 - 1.0f32) / 2.0f32) * spacing
+                    };
+                    
+                    let position = Point3::new(x, y, z);
+                    self.objects.push(RenderableObject::new(position, cube_size));
                 }
             }
         }
         
         self.total_objects = self.objects.len() as u32;
-        console::log_1(&format!("🎨 Instancing demo enabled with {} objects", self.total_objects).into());
+        let total_spread = grid_size as f32 * cube_diameter;
+        console::log_1(&format!("🎨 Instancing demo: {}x{}x{} grid = {} cubes (cube_diameter: {:.3}, cube_radius: {:.3}, total_spread: {:.3})", 
+            grid_size, grid_size, grid_size, self.total_objects, cube_diameter, cube_size, total_spread).into());
     }
+    
 } 
