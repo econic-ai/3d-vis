@@ -43,7 +43,11 @@ pub struct MainView {
 impl MainView {
     pub fn new(width: u32, height: u32) -> Self {
         let mut main_view = Self {
-            camera: Camera::new(width, height),
+            camera: Camera::new_for_scene(
+                width, 
+                height, 
+                0.6     // target_coverage: scene takes 60% of viewport height
+            ),
             objects: Vec::new(),
             uniforms: Uniforms::new(),
             uniforms_dirty: true,

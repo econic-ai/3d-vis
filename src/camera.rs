@@ -19,6 +19,10 @@ pub struct Camera {
     // Screen dimensions for aspect ratio
     width: u32,
     height: u32,
+    
+    // Optimal distance tracking (for scene-based cameras only)
+    original_optimal_distance: Option<f32>,
+    target_coverage: Option<f32>,
 }
 
 impl Camera {
@@ -36,7 +40,55 @@ impl Camera {
             view_dirty: true,
             width,
             height,
+            original_optimal_distance: None,
+            target_coverage: None,
         }
+    }
+    
+    /// Create a new camera with optimal distance calculated for a standardized scene
+    pub fn new_for_scene(
+        width: u32, 
+        height: u32, 
+        target_coverage: f32
+    ) -> Self {
+        let optimal_distance = Self::calculate_distance_for_viewport(
+            width, 
+            target_coverage
+        );
+        
+        Self {
+            distance: optimal_distance,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            rotation_x: 0.0,
+            rotation_y: 0.0,
+            cached_projection_matrix: cgmath::Matrix4::identity(),
+            cached_view_matrix: cgmath::Matrix4::identity(),
+            cached_view_proj_matrix: cgmath::Matrix4::identity(),
+            projection_dirty: true,
+            view_dirty: true,
+            width,
+            height,
+            original_optimal_distance: Some(optimal_distance),
+            target_coverage: Some(target_coverage),
+        }
+    }
+    
+    /// Calculate optimal camera distance considering viewport dimensions
+    fn calculate_distance_for_viewport(
+        width: u32,
+        target_coverage: f32,
+    ) -> f32 {
+        // Distance calculation based purely on width
+        // Assumption: wider screens need closer camera, narrower screens need farther camera
+        let reference_width = 2500.0; // Width where distance feels optimal
+        let reference_distance = 10.0; // Optimal distance for reference width
+        
+        // Inverse relationship: distance = reference_distance * (reference_width / current_width)
+        let distance = reference_distance * (reference_width / width as f32) * target_coverage;
+        
+        // Clamp to reasonable bounds
+        distance.clamp(0.5, 50.0)
     }
     
     pub fn zoom(&mut self, delta: f32) {
@@ -111,6 +163,29 @@ impl Camera {
             self.width = width;
             self.height = height;
             
+            // For scene-based cameras, recalculate optimal distance and preserve zoom factor
+            if let (Some(original_optimal), Some(target_coverage)) = 
+                (self.original_optimal_distance, self.target_coverage) {
+                
+                // Calculate current zoom factor (current distance / original optimal distance)
+                let zoom_factor = self.distance / original_optimal;
+                
+                // Calculate new optimal distance for new canvas size
+                let new_optimal_distance = Self::calculate_distance_for_viewport(
+                    width,
+                    target_coverage
+                );
+                
+                // Apply the same zoom factor to the new optimal distance
+                self.distance = new_optimal_distance * zoom_factor;
+                
+                // Update the stored optimal distance
+                self.original_optimal_distance = Some(new_optimal_distance);
+                
+                // Mark view as dirty since distance changed
+                self.mark_view_dirty();
+            }
+            
             // Mark projection matrix as dirty (resize)  
             self.mark_projection_dirty();
         }
@@ -180,6 +255,11 @@ impl Camera {
     // Get current camera state for performance tracking
     pub fn get_state(&self) -> (f32, f32, f32, f32, f32) {
         (self.distance, self.pan_x, self.pan_y, self.rotation_x, self.rotation_y)
+    }
+    
+    // Get current camera dimensions
+    pub fn get_dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
     
     // Helper method to mark view matrix as dirty (camera changed)
