@@ -70,6 +70,10 @@ impl GizmoView {
         self.enabled
     }
     
+    pub fn mark_dirty(&mut self) {
+        self.uniforms_dirty = true;
+    }
+    
     pub fn get_viewport_region(&self, canvas_width: u32, canvas_height: u32) -> (f32, f32, f32, f32) {
         if !self.enabled {
             return (0.0, 0.0, 0.0, 0.0); // No viewport when disabled

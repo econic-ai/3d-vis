@@ -48,7 +48,7 @@ impl Camera {
         self.distance /= zoom_factor;
         
         // Clamp camera distance to reasonable bounds
-        self.distance = self.distance.clamp(1.0, 50.0);
+        self.distance = self.distance.clamp(0.1, 50.0);
         
         // Mark view matrix as dirty (camera changed)
         self.mark_view_dirty();

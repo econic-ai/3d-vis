@@ -590,13 +590,16 @@ impl CubeRenderer {
     
     #[wasm_bindgen]
     pub fn render(&mut self) -> Result<(), JsValue> {
+        // Track that render() was called (for FPS calculation)
+        self.performance_tracker.track_render_call();
+        
         // Only render if something has actually changed
         if !self.main_view.is_dirty() && !self.gizmo_view.is_dirty() {
             return Ok(()); // Skip entire render cycle - previous frame stays visible
         }
         
-        // Start performance tracking for this frame
-        self.performance_tracker.start_frame();
+        // Start tracking actual render work (dirty frame)
+        self.performance_tracker.start_actual_render();
         
         // Update main view if dirty and get rotation for gizmo
         let main_rotation = self.main_view.update_if_dirty();
@@ -607,23 +610,7 @@ impl CubeRenderer {
         // Update gizmo view if dirty
         self.gizmo_view.update_if_dirty();
         
-        // Track camera state changes for performance metrics
-        let camera_state = self.main_view.camera.get_state();
-        self.performance_tracker.track_camera_change(
-            camera_state.0, camera_state.1, camera_state.2, camera_state.3, camera_state.4
-        );
-        
-        // Calculate timing info
-        let matrix_calc_time = if self.main_view.camera.is_dirty() {
-            self.main_view.camera.update_matrices()
-        } else {
-            0.0
-        };
-        self.performance_tracker.current_matrix_calc_time = matrix_calc_time;
-
-        // Time buffer upload for main view uniforms
-        let buffer_start = now();
-        
+        // Update uniforms
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -637,20 +624,11 @@ impl CubeRenderer {
             bytemuck::cast_slice(&[*self.gizmo_view.get_uniforms()]),
         );
         
-        // Track buffer upload (uniform buffer is 64 bytes: 4x4 f32 matrix)
-        self.performance_tracker.track_buffer_upload(64);
-        self.performance_tracker.track_uniform_update();
-        
-        let buffer_end = now();
-        self.performance_tracker.current_buffer_upload_time = buffer_end - buffer_start;
-        
         // Combine instance data from all views
         self.instance_data.clear();
         
         // Add main view instances
         self.instance_data.extend_from_slice(self.main_view.get_instance_data());
-        
-        // Note: Gizmo no longer uses instancing - it renders as static geometry
         
         // Update instance buffer with main view data only
         if !self.instance_data.is_empty() {
@@ -662,9 +640,7 @@ impl CubeRenderer {
             );
         }
         
-        // Time GPU submission (this always happens)
-        let gpu_start = now();
-
+        // Render to GPU
         let output = self.surface
             .get_current_texture()
             .map_err(|e| JsValue::from_str(&format!("Failed to get surface texture: {:?}", e)))?;
@@ -673,16 +649,14 @@ impl CubeRenderer {
             .texture
             .create_view(&self.texture_view_desc);
 
-        // Use cached command encoder descriptor for optimization
         let mut encoder = self
             .device
             .create_command_encoder(&self.command_encoder_desc);
 
         // Render each view in its own viewport
         {
-            // Create render pass with inline descriptor to avoid allocation
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None, // Skip label in release builds for performance
+                label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -706,39 +680,22 @@ impl CubeRenderer {
             // Render main view with full viewport
             let (x, y, w, h) = self.main_view.get_viewport_region(self.width, self.height);
             render_pass.set_viewport(x, y, w, h, 0.0, 1.0);
-            
-            // Set pipeline and buffers for main view
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            
-            // Draw main view instances
-            let main_instance_count = self.main_view.get_instance_data().len() as u32;
-            if main_instance_count > 0 {
-                render_pass.draw_indexed(0..self.num_indices, 0, 0..main_instance_count);
-            }
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..self.main_view.get_instance_data().len() as u32);
             
             // Render gizmo view if enabled
             if self.gizmo_view.is_enabled() {
                 let (gx, gy, gw, gh) = self.gizmo_view.get_viewport_region(self.width, self.height);
-                if gw > 0.0 && gh > 0.0 {
-                    render_pass.set_viewport(gx, gy, gw, gh, 0.0, 1.0);
-                    
-                    // Switch to gizmo render pipeline for flat shading
-                    render_pass.set_pipeline(&self.gizmo_render_pipeline);
-                    
-                    // Use gizmo's own uniform buffer with its camera transform
-                    render_pass.set_bind_group(0, &self.gizmo_uniform_bind_group, &[]);
-                    
-                    // Use gizmo-specific geometry (no instancing needed)
-                    render_pass.set_vertex_buffer(0, self.gizmo_vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(self.gizmo_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                    
-                    // Draw gizmo directly (no instances)
-                    render_pass.draw_indexed(0..self.gizmo_num_indices, 0, 0..1);
-                }
+                render_pass.set_viewport(gx, gy, gw, gh, 0.0, 1.0);
+                render_pass.set_pipeline(&self.gizmo_render_pipeline);
+                render_pass.set_bind_group(0, &self.gizmo_uniform_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.gizmo_vertex_buffer.slice(..));
+                render_pass.set_index_buffer(self.gizmo_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..self.gizmo_num_indices, 0, 0..1);
             }
         }
 
@@ -746,11 +703,8 @@ impl CubeRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        let gpu_end = now();
-        self.performance_tracker.current_gpu_submit_time = gpu_end - gpu_start;
-
         // End performance tracking
-        self.performance_tracker.end_frame();
+        self.performance_tracker.end_actual_render();
 
         Ok(())
     }
@@ -771,7 +725,6 @@ impl CubeRenderer {
                 self.calculate_scene_size_memory_bytes(),
                 self.calculate_active_view_memory_bytes(),
                 self.main_view.visible_objects,
-                VERTICES.len(),
             );
             
             Some(snapshot)
@@ -990,15 +943,20 @@ impl CubeRenderer {
     #[wasm_bindgen]
     pub fn enable_gizmo(&mut self) {
         self.gizmo_view.enable();
+        // Force immediate re-render by marking uniforms dirty
+        self.gizmo_view.mark_dirty();
     }
     
     #[wasm_bindgen]
     pub fn disable_gizmo(&mut self) {
         self.gizmo_view.disable();
+        // Force immediate re-render by marking uniforms dirty
+        self.gizmo_view.mark_dirty();
     }
     
     #[wasm_bindgen]
     pub fn is_gizmo_enabled(&self) -> bool {
-        self.gizmo_view.is_enabled()
+        let enabled = self.gizmo_view.is_enabled();
+        enabled
     }
 } 
