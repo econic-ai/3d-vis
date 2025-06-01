@@ -1,0 +1,15 @@
+{
+  "name": "three_d_vis",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "three_d_vis_bg.wasm",
+    "three_d_vis.js",
+    "three_d_vis.d.ts"
+  ],
+  "main": "three_d_vis.js",
+  "types": "three_d_vis.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
