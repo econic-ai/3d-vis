@@ -30,7 +30,7 @@ fn vs_main(
 ) -> VertexOutput {
     var out: VertexOutput;
     
-    // Use vertex color to choose between purple and pink faces
+    // Use vertex color to choose between purple and pink faces for beautiful 3D shading
     if (model.color.r > 0.5) {
         // Red vertex (front face) -> Purple
         out.color = vec3<f32>(0.6, 0.2, 0.8); // Purple

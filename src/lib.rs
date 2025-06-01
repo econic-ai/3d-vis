@@ -3,6 +3,8 @@ mod performance;
 mod types;
 mod camera;
 mod math;
+mod main_view;
+mod gizmo_view;
 
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, console};
@@ -11,27 +13,11 @@ use cgmath::Point3;
 
 // Re-export from modules
 pub use performance::{PerformanceSnapshot, PerformanceTracker, now};
-pub use types::{Vertex, Uniforms, VERTICES, INDICES, InstanceData};
+pub use types::{Vertex, Uniforms, VERTICES, INDICES, InstanceData, GIZMO_VERTICES, GIZMO_INDICES};
 pub use camera::Camera;
 pub use math::{Frustum, BoundingSphere};
-
-// Simple renderable object for demonstrating frustum culling
-#[derive(Debug, Clone)]
-struct RenderableObject {
-    position: Point3<f32>,
-    bounding_sphere: BoundingSphere,
-    visible: bool, // Result of frustum culling
-}
-
-impl RenderableObject {
-    fn new(position: Point3<f32>, size: f32) -> Self {
-        Self {
-            position,
-            bounding_sphere: BoundingSphere::for_cube(position, size),
-            visible: true,
-        }
-    }
-}
+pub use main_view::{MainView, RenderableObject};
+pub use gizmo_view::GizmoView;
 
 #[wasm_bindgen]
 pub struct CubeRenderer {
@@ -42,9 +28,15 @@ pub struct CubeRenderer {
     width: u32,
     height: u32,
     render_pipeline: wgpu::RenderPipeline,
+    gizmo_render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    
+    // Gizmo geometry buffer
+    gizmo_vertex_buffer: wgpu::Buffer,
+    gizmo_index_buffer: wgpu::Buffer,
+    gizmo_num_indices: u32,
     
     // Instance buffer for GPU instancing
     instance_buffer: wgpu::Buffer,
@@ -55,15 +47,17 @@ pub struct CubeRenderer {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     
+    // Gizmo uniform buffer (separate from main view)
+    gizmo_uniform_buffer: wgpu::Buffer,
+    gizmo_uniform_bind_group: wgpu::BindGroup,
+    
     // Depth buffer for 3D rendering
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     
-    // Camera system
-    camera: Camera,
-    
-    // Dirty tracking for optimization
-    uniforms_dirty: bool,
+    // View system
+    main_view: MainView,
+    gizmo_view: GizmoView,
     
     // Command buffer optimization - cache descriptors
     command_encoder_desc: wgpu::CommandEncoderDescriptor<'static>,
@@ -75,14 +69,6 @@ pub struct CubeRenderer {
     // Performance tracking
     performance_tracker: PerformanceTracker,
     
-    // Objects to render (for frustum culling demonstration)
-    objects: Vec<RenderableObject>,
-    
-    // Frustum culling state
-    current_frustum: Option<Frustum>,
-    visible_objects: u32,
-    total_objects: u32,
-    
     // Cached geometry metrics (updated only on scene changes)
     cached_object_count: u32,
     cached_edge_count: u32,
@@ -92,6 +78,26 @@ pub struct CubeRenderer {
 
 #[wasm_bindgen]
 impl CubeRenderer {
+    fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (depth_texture, depth_view)
+    }
+
     fn parse_hex_color(hex: &str) -> Result<wgpu::Color, JsValue> {
         let hex = hex.trim_start_matches('#');
         if hex.len() != 6 {
@@ -301,6 +307,12 @@ impl CubeRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
+        // Create gizmo shader
+        let gizmo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Gizmo Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("gizmo_shader.wgsl").into()),
+        });
+
         // Create uniform buffer
         let uniforms = Uniforms::new();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -384,6 +396,51 @@ impl CubeRenderer {
             multiview: None,
         });
 
+        // Create gizmo render pipeline with the gizmo shader
+        let gizmo_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Gizmo Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            cache: None,
+            vertex: wgpu::VertexState {
+                module: &gizmo_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &gizmo_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(VERTICES),
@@ -413,22 +470,38 @@ impl CubeRenderer {
         });
 
         // Create depth texture for 3D rendering
-        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Depth Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
+        let (depth_texture, depth_view) = Self::create_depth_texture(&device, width, height);
+
+        // Create gizmo uniform buffer
+        let gizmo_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Gizmo Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[Uniforms::new()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let gizmo_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: gizmo_uniform_buffer.as_entire_binding(),
+            }],
+            label: Some("gizmo_uniform_bind_group"),
+        });
+
+        // Create gizmo geometry buffers
+        let gizmo_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Gizmo Vertex Buffer"),
+            contents: bytemuck::cast_slice(GIZMO_VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let gizmo_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Gizmo Index Buffer"),
+            contents: bytemuck::cast_slice(GIZMO_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let gizmo_num_indices = GIZMO_INDICES.len() as u32;
 
         // Create the renderer instance
         let renderer = Self {
@@ -439,13 +512,13 @@ impl CubeRenderer {
             width,
             height,
             render_pipeline,
+            gizmo_render_pipeline,
             vertex_buffer,
             index_buffer,
             num_indices,
             uniforms,
             uniform_buffer,
             uniform_bind_group,
-            camera: Camera::new(width, height),
             background_color: bg_color,
             performance_tracker: PerformanceTracker::new(),
             command_encoder_desc: wgpu::CommandEncoderDescriptor {
@@ -453,13 +526,8 @@ impl CubeRenderer {
                 ..Default::default()
             },
             texture_view_desc: wgpu::TextureViewDescriptor::default(),
-            uniforms_dirty: true,
             depth_texture,
             depth_view,
-            objects: Vec::new(),
-            current_frustum: None,
-            visible_objects: 0,
-            total_objects: 0,
             instance_buffer,
             instance_data: Vec::new(),
             max_instances,
@@ -467,6 +535,13 @@ impl CubeRenderer {
             cached_edge_count: 0,
             cached_vertex_count: 0,
             cached_index_count: 0,
+            main_view: MainView::new(width, height),
+            gizmo_view: GizmoView::new(width, height),
+            gizmo_uniform_buffer,
+            gizmo_uniform_bind_group,
+            gizmo_vertex_buffer,
+            gizmo_index_buffer,
+            gizmo_num_indices,
         };
         
         console::log_1(&"🎯 Renderer created with clean state (no default objects)".into());
@@ -476,115 +551,116 @@ impl CubeRenderer {
 
     #[wasm_bindgen]
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width > 0 && height > 0 {
+        if width > 0 && height > 0 {           
+            // Update dimensions
             self.width = width;
             self.height = height;
             self.config.width = width;
             self.config.height = height;
+            
+            // Reconfigure surface
             self.surface.configure(&self.device, &self.config);
             
-            // Recreate depth buffer for new size
-            self.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Depth Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Depth32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            });
-            self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            // Recreate depth texture for new size
+            let (depth_texture, depth_view) = Self::create_depth_texture(&self.device, width, height);
+            self.depth_texture = depth_texture;
+            self.depth_view = depth_view;
             
-            // Update camera dimensions and mark matrices as dirty
-            self.camera.resize(width, height);
-            self.uniforms_dirty = true;
+            // Update view dimensions
+            self.main_view.resize(width, height);
+            self.gizmo_view.resize(width, height);
             
-            console::log_1(&format!("Resized canvas to width: {}, height: {}", width, height).into());
         }
     }
 
     #[wasm_bindgen]
     pub fn zoom(&mut self, delta: f32) {
-        self.camera.zoom(delta);
-        self.uniforms_dirty = true;
+        self.main_view.zoom(delta);
     }
 
     #[wasm_bindgen]
     pub fn pan(&mut self, delta_x: f32, delta_y: f32) {
-        self.camera.pan(delta_x, delta_y);
-        self.uniforms_dirty = true;
+        self.main_view.pan(delta_x, delta_y);
     }
 
     #[wasm_bindgen]
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
-        self.camera.rotate(delta_x, delta_y);
-        self.uniforms_dirty = true;
+        self.main_view.rotate(delta_x, delta_y);
     }
     
     #[wasm_bindgen]
     pub fn render(&mut self) -> Result<(), JsValue> {
+        // Only render if something has actually changed
+        if !self.main_view.is_dirty() && !self.gizmo_view.is_dirty() {
+            return Ok(()); // Skip entire render cycle - previous frame stays visible
+        }
+        
         // Start performance tracking for this frame
         self.performance_tracker.start_frame();
         
+        // Update main view if dirty and get rotation for gizmo
+        let main_rotation = self.main_view.update_if_dirty();
+        
+        // Update gizmo view from main camera rotation
+        self.gizmo_view.update_from_main_camera(main_rotation);
+        
+        // Update gizmo view if dirty
+        self.gizmo_view.update_if_dirty();
+        
         // Track camera state changes for performance metrics
-        let camera_state = self.camera.get_state();
+        let camera_state = self.main_view.camera.get_state();
         self.performance_tracker.track_camera_change(
             camera_state.0, camera_state.1, camera_state.2, camera_state.3, camera_state.4
         );
         
-        // Only recalculate matrices and update uniforms if camera changed
-        if self.uniforms_dirty {
-            // Get the view-projection matrix from camera (with timing)
-            let matrix_calc_time = if self.camera.is_dirty() {
-                self.camera.update_matrices()
-            } else {
-                0.0
-            };
-            
-            // Update uniforms with the combined matrix
-            let view_proj_matrix = self.camera.get_view_proj_matrix();
-            self.uniforms.update_view_proj(view_proj_matrix);
-            
-            // Extract frustum for culling
-            self.current_frustum = Some(Frustum::from_view_proj_matrix(view_proj_matrix));
-            
-            // Record matrix calculation time
-            self.performance_tracker.current_matrix_calc_time = matrix_calc_time;
-
-            // Time buffer upload
-            let buffer_start = now();
-            
-            self.queue.write_buffer(
-                &self.uniform_buffer,
-                0,
-                bytemuck::cast_slice(&[self.uniforms]),
-            );
-            
-            // Track buffer upload (uniform buffer is 64 bytes: 4x4 f32 matrix)
-            self.performance_tracker.track_buffer_upload(64);
-            self.performance_tracker.track_uniform_update();
-            
-            let buffer_end = now();
-            self.performance_tracker.current_buffer_upload_time = buffer_end - buffer_start;
-            
-            // Mark uniforms as clean now that we've updated them
-            self.uniforms_dirty = false;
+        // Calculate timing info
+        let matrix_calc_time = if self.main_view.camera.is_dirty() {
+            self.main_view.camera.update_matrices()
         } else {
-            // Camera hasn't changed, so we skip expensive operations
-            self.performance_tracker.current_matrix_calc_time = 0.0;
-            self.performance_tracker.current_buffer_upload_time = 0.0;
-        }
+            0.0
+        };
+        self.performance_tracker.current_matrix_calc_time = matrix_calc_time;
 
-        // Perform frustum culling on objects
-        self.perform_frustum_culling();
+        // Time buffer upload for main view uniforms
+        let buffer_start = now();
         
-        // Update instance data for GPU instancing (includes scene objects + gizmo cubes)
-        self.update_instance_data();
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[*self.main_view.get_uniforms()]),
+        );
+        
+        // Update gizmo uniform buffer with gizmo's view matrix
+        self.queue.write_buffer(
+            &self.gizmo_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[*self.gizmo_view.get_uniforms()]),
+        );
+        
+        // Track buffer upload (uniform buffer is 64 bytes: 4x4 f32 matrix)
+        self.performance_tracker.track_buffer_upload(64);
+        self.performance_tracker.track_uniform_update();
+        
+        let buffer_end = now();
+        self.performance_tracker.current_buffer_upload_time = buffer_end - buffer_start;
+        
+        // Combine instance data from all views
+        self.instance_data.clear();
+        
+        // Add main view instances
+        self.instance_data.extend_from_slice(self.main_view.get_instance_data());
+        
+        // Note: Gizmo no longer uses instancing - it renders as static geometry
+        
+        // Update instance buffer with main view data only
+        if !self.instance_data.is_empty() {
+            let byte_data = bytemuck::cast_slice(&self.instance_data);
+            self.queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                byte_data,
+            );
+        }
         
         // Time GPU submission (this always happens)
         let gpu_start = now();
@@ -602,7 +678,7 @@ impl CubeRenderer {
             .device
             .create_command_encoder(&self.command_encoder_desc);
 
-        // Optimized render pass setup with minimal allocations
+        // Render each view in its own viewport
         {
             // Create render pass with inline descriptor to avoid allocation
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -627,20 +703,42 @@ impl CubeRenderer {
                 timestamp_writes: None,
             });
 
-            // Render main scene with full viewport FIRST
-            render_pass.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
+            // Render main view with full viewport
+            let (x, y, w, h) = self.main_view.get_viewport_region(self.width, self.height);
+            render_pass.set_viewport(x, y, w, h, 0.0, 1.0);
             
-            // Batch render pass operations for efficiency
+            // Set pipeline and buffers for main view
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             
-            // Use instanced drawing - render all visible objects in a single draw call
-            let instance_count = self.instance_data.len() as u32;
-            if instance_count > 0 {
-                render_pass.draw_indexed(0..self.num_indices, 0, 0..instance_count);
+            // Draw main view instances
+            let main_instance_count = self.main_view.get_instance_data().len() as u32;
+            if main_instance_count > 0 {
+                render_pass.draw_indexed(0..self.num_indices, 0, 0..main_instance_count);
+            }
+            
+            // Render gizmo view if enabled
+            if self.gizmo_view.is_enabled() {
+                let (gx, gy, gw, gh) = self.gizmo_view.get_viewport_region(self.width, self.height);
+                if gw > 0.0 && gh > 0.0 {
+                    render_pass.set_viewport(gx, gy, gw, gh, 0.0, 1.0);
+                    
+                    // Switch to gizmo render pipeline for flat shading
+                    render_pass.set_pipeline(&self.gizmo_render_pipeline);
+                    
+                    // Use gizmo's own uniform buffer with its camera transform
+                    render_pass.set_bind_group(0, &self.gizmo_uniform_bind_group, &[]);
+                    
+                    // Use gizmo-specific geometry (no instancing needed)
+                    render_pass.set_vertex_buffer(0, self.gizmo_vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(self.gizmo_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    
+                    // Draw gizmo directly (no instances)
+                    render_pass.draw_indexed(0..self.gizmo_num_indices, 0, 0..1);
+                }
             }
         }
 
@@ -651,9 +749,7 @@ impl CubeRenderer {
         let gpu_end = now();
         self.performance_tracker.current_gpu_submit_time = gpu_end - gpu_start;
 
-        // End performance tracking and return snapshot if available
-        // Note: We don't return the snapshot from render() to avoid affecting performance
-        // JavaScript will poll for snapshots separately
+        // End performance tracking
         self.performance_tracker.end_frame();
 
         Ok(())
@@ -674,7 +770,7 @@ impl CubeRenderer {
                 self.calculate_current_memory_usage(),
                 self.calculate_scene_size_memory_bytes(),
                 self.calculate_active_view_memory_bytes(),
-                self.visible_objects,
+                self.main_view.visible_objects,
                 VERTICES.len(),
             );
             
@@ -686,18 +782,20 @@ impl CubeRenderer {
 
     #[wasm_bindgen]
     pub fn get_visible_objects(&self) -> u32 {
-        self.visible_objects
+        self.main_view.visible_objects
     }
     
     #[wasm_bindgen]
     pub fn get_total_objects(&self) -> u32 {
-        self.total_objects
+        self.main_view.total_objects
     }
     
     #[wasm_bindgen]
     pub fn get_culling_ratio(&self) -> f32 {
-        if self.total_objects > 0 {
-            (self.total_objects - self.visible_objects) as f32 / self.total_objects as f32
+        let total = self.main_view.total_objects;
+        let visible = self.main_view.visible_objects;
+        if total > 0 {
+            (total - visible) as f32 / total as f32
         } else {
             0.0
         }
@@ -705,7 +803,7 @@ impl CubeRenderer {
 
     #[wasm_bindgen]
     pub fn create_test_objects(&mut self, count: u32) {
-        self.objects.clear();
+        self.main_view.clear_objects();
         
         // Create a grid of cubes for testing frustum culling
         let grid_size = (count as f32).cbrt().ceil() as i32;
@@ -715,7 +813,7 @@ impl CubeRenderer {
         for x in 0..grid_size {
             for y in 0..grid_size {
                 for z in 0..grid_size {
-                    if self.objects.len() >= count as usize {
+                    if self.main_view.objects.len() >= count as usize {
                         break;
                     }
                     
@@ -725,88 +823,27 @@ impl CubeRenderer {
                         z as f32 * spacing - offset,
                     );
                     
-                    self.objects.push(RenderableObject::new(position, 2.0));
+                    self.main_view.objects.push(RenderableObject::new(position, 2.0));
                 }
-                if self.objects.len() >= count as usize {
+                if self.main_view.objects.len() >= count as usize {
                     break;
                 }
             }
-            if self.objects.len() >= count as usize {
+            if self.main_view.objects.len() >= count as usize {
                 break;
             }
         }
         
-        self.total_objects = self.objects.len() as u32;
-        console::log_1(&format!("Created {} test objects for frustum culling", self.total_objects).into());
-    }
-    
-    fn perform_frustum_culling(&mut self) {
-        if let Some(ref frustum) = self.current_frustum {
-            self.visible_objects = 0;
-            
-            for object in &mut self.objects {
-                object.visible = frustum.contains_sphere(
-                    object.bounding_sphere.center,
-                    object.bounding_sphere.radius,
-                );
-                
-                if object.visible {
-                    self.visible_objects += 1;
-                }
-            }
-        } else {
-            // No frustum available, mark all as visible
-            self.visible_objects = self.total_objects;
-            for object in &mut self.objects {
-                object.visible = true;
-            }
-        }
-    }
-
-    fn update_instance_data(&mut self) {
-        // Clear previous instance data
-        self.instance_data.clear();
+        self.main_view.total_objects = self.main_view.objects.len() as u32;
+        self.main_view.mark_dirty(); // Mark view as dirty to trigger update
         
-        // Populate instance data from visible objects only
-        for object in &self.objects {
-            if object.visible {
-                let color = if object.position.x == 0.0 && object.position.y == 0.0 && object.position.z == 0.0 {
-                    // Default cube at origin gets beautiful purple-pink color
-                    [0.8, 0.2, 0.8]
-                } else {
-                    // Other objects get height-based coloring
-                    match object.position.y {
-                        y if y > 2.0 => [1.0, 0.2, 0.2], // Red for high objects
-                        y if y < -2.0 => [0.2, 0.2, 1.0], // Blue for low objects
-                        _ => [0.2, 1.0, 0.2], // Green for middle objects
-                    }
-                };
-                
-                self.instance_data.push(InstanceData::new(
-                    [object.position.x, object.position.y, object.position.z],
-                    color,
-                    object.bounding_sphere.radius,
-                ));
-            }
-        }
-    
-        // Update instance buffer with all data (scene objects + gizmo cubes)
-        if !self.instance_data.is_empty() {
-            let byte_data = bytemuck::cast_slice(&self.instance_data);
-            self.queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                byte_data,
-            );
-        }
+        let total_objects = self.main_view.objects.len() as u32;
+        console::log_1(&format!("Created {} test objects for frustum culling", total_objects).into());
     }
-
+    
     #[wasm_bindgen]
     pub fn add_object(&mut self, x: f32, y: f32, z: f32, radius: f32) {
-        let position = Point3::new(x, y, z);
-        let object = RenderableObject::new(position, radius * 2.0); // size = diameter
-        self.objects.push(object);
-        self.total_objects = self.objects.len() as u32;
+        self.main_view.add_object(x, y, z, radius);
         
         // Update cached geometry metrics after scene change
         self.update_geometry_metrics();
@@ -815,7 +852,7 @@ impl CubeRenderer {
     #[wasm_bindgen]
     pub fn enable_instancing_demo_with_size(&mut self, grid_size: u32) {
         // Create a grid of colorful cubes to demonstrate instancing
-        self.objects.clear();
+        self.main_view.clear_objects();
         
         let grid_size = grid_size as i32;
         
@@ -867,15 +904,17 @@ impl CubeRenderer {
                     };
                     
                     let position = Point3::new(x, y, z);
-                    self.objects.push(RenderableObject::new(position, cube_size));
+                    self.main_view.objects.push(RenderableObject::new(position, cube_size));
                 }
             }
         }
         
-        self.total_objects = self.objects.len() as u32;
+        self.main_view.total_objects = self.main_view.objects.len() as u32;
+        self.main_view.mark_dirty(); // Mark view as dirty to trigger update
+        
         let total_spread = grid_size as f32 * cube_diameter;
         console::log_1(&format!("🎨 Instancing demo: {}x{}x{} grid = {} cubes (cube_diameter: {:.3}, cube_radius: {:.3}, total_spread: {:.3})", 
-            grid_size, grid_size, grid_size, self.total_objects, cube_diameter, cube_size, total_spread).into());
+            grid_size, grid_size, grid_size, self.main_view.total_objects, cube_diameter, cube_size, total_spread).into());
         
         // Update cached geometry metrics after scene change
         self.update_geometry_metrics();
@@ -883,13 +922,13 @@ impl CubeRenderer {
     
     // Update cached geometry metrics - call only when scene changes
     fn update_geometry_metrics(&mut self) {
-        self.cached_object_count = self.objects.len() as u32;
+        self.cached_object_count = self.main_view.objects.len() as u32;
         
         // For current cube-based system
-        if !self.objects.is_empty() {
-            self.cached_vertex_count = (self.objects.len() as u32) * (VERTICES.len() as u32);
-            self.cached_index_count = (self.objects.len() as u32) * (INDICES.len() as u32);
-            self.cached_edge_count = (self.objects.len() as u32) * 12; // 12 edges per cube
+        if !self.main_view.objects.is_empty() {
+            self.cached_vertex_count = (self.main_view.objects.len() as u32) * (VERTICES.len() as u32);
+            self.cached_index_count = (self.main_view.objects.len() as u32) * (INDICES.len() as u32);
+            self.cached_edge_count = (self.main_view.objects.len() as u32) * 12; // 12 edges per cube
         } else {
             self.cached_vertex_count = 0;
             self.cached_index_count = 0; 
@@ -913,7 +952,7 @@ impl CubeRenderer {
     
     // Calculate total scene memory (all objects, regardless of visibility)
     fn calculate_scene_size_memory_bytes(&self) -> u64 {
-        if self.total_objects == 0 {
+        if self.main_view.total_objects == 0 {
             return 0;
         }
         
@@ -922,14 +961,14 @@ impl CubeRenderer {
         
         // The vertex and index buffers are shared across all objects, so we only scale instance data
         let shared_geometry_memory = std::mem::size_of_val(VERTICES) as u64 + std::mem::size_of_val(INDICES) as u64;
-        let instance_memory = (self.total_objects as u64) * instance_data_per_object;
+        let instance_memory = (self.main_view.total_objects as u64) * instance_data_per_object;
         
         shared_geometry_memory + instance_memory
     }
     
     // Calculate active view memory (visible objects only, post-culling)
     fn calculate_active_view_memory_bytes(&self) -> u64 {
-        if self.visible_objects == 0 {
+        if self.main_view.visible_objects == 0 {
             return 0;
         }
         
@@ -937,13 +976,29 @@ impl CubeRenderer {
         let instance_data_per_object = std::mem::size_of::<InstanceData>() as u64;
         
         // The vertex and index buffers are still shared, but we only count visible instance data
-        let shared_geometry_memory = if self.visible_objects > 0 { 
+        let shared_geometry_memory = if self.main_view.visible_objects > 0 { 
             std::mem::size_of_val(VERTICES) as u64 + std::mem::size_of_val(INDICES) as u64 
         } else { 
             0 
         };
-        let visible_instance_memory = (self.visible_objects as u64) * instance_data_per_object;
+        let visible_instance_memory = (self.main_view.visible_objects as u64) * instance_data_per_object;
         
         shared_geometry_memory + visible_instance_memory
+    }
+
+    // Gizmo control methods
+    #[wasm_bindgen]
+    pub fn enable_gizmo(&mut self) {
+        self.gizmo_view.enable();
+    }
+    
+    #[wasm_bindgen]
+    pub fn disable_gizmo(&mut self) {
+        self.gizmo_view.disable();
+    }
+    
+    #[wasm_bindgen]
+    pub fn is_gizmo_enabled(&self) -> bool {
+        self.gizmo_view.is_enabled()
     }
 } 

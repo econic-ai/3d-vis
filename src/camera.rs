@@ -183,7 +183,7 @@ impl Camera {
     }
     
     // Helper method to mark view matrix as dirty (camera changed)
-    fn mark_view_dirty(&mut self) {
+    pub fn mark_view_dirty(&mut self) {
         self.view_dirty = true;
     }
     
