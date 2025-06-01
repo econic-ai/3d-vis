@@ -38,7 +38,7 @@ impl GizmoView {
         
         let mut gizmo = Self {
             camera,
-            enabled: true,
+            enabled: false,
             uniforms: Uniforms::new(),
             uniforms_dirty: true,
             last_main_rotation: None,
