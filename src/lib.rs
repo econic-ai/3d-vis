@@ -583,9 +583,9 @@ impl CubeRenderer {
         // Perform frustum culling on objects
         self.perform_frustum_culling();
         
-        // Update instance data for GPU instancing (only visible objects)
+        // Update instance data for GPU instancing (includes scene objects + gizmo cubes)
         self.update_instance_data();
-
+        
         // Time GPU submission (this always happens)
         let gpu_start = now();
 
@@ -627,6 +627,9 @@ impl CubeRenderer {
                 timestamp_writes: None,
             });
 
+            // Render main scene with full viewport FIRST
+            render_pass.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
+            
             // Batch render pass operations for efficiency
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -786,8 +789,8 @@ impl CubeRenderer {
                 ));
             }
         }
-        
-        // Update instance buffer if we have data
+    
+        // Update instance buffer with all data (scene objects + gizmo cubes)
         if !self.instance_data.is_empty() {
             let byte_data = bytemuck::cast_slice(&self.instance_data);
             self.queue.write_buffer(
