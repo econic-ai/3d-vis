@@ -85,7 +85,7 @@ impl Camera {
         let reference_distance = 10.0; // Optimal distance for reference width
         
         // Inverse relationship: distance = reference_distance * (reference_width / current_width)
-        let distance = reference_distance * (reference_width / width as f32) * target_coverage;
+        let distance = reference_distance * (reference_width / width as f32) / target_coverage;
         
         // Clamp to reasonable bounds
         distance.clamp(0.5, 50.0)

@@ -1,9 +1,7 @@
 use crate::camera::Camera;
 use crate::types::{InstanceData, Uniforms};
 use crate::math::{Frustum, BoundingSphere};
-use crate::performance::now;
 use cgmath::Point3;
-use wgpu::util::DeviceExt;
 
 // Simple renderable object for main scene
 #[derive(Debug, Clone)]
@@ -46,7 +44,7 @@ impl MainView {
             camera: Camera::new_for_scene(
                 width, 
                 height, 
-                0.6     // target_coverage: scene takes 60% of viewport height
+                2.0     // target_coverage: scene takes 60% of viewport height
             ),
             objects: Vec::new(),
             uniforms: Uniforms::new(),
