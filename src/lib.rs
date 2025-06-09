@@ -244,17 +244,21 @@ impl CubeRenderer {
         height: u32,
         bg_color: wgpu::Color,
     ) -> Result<CubeRenderer, JsValue> {
-        // Log adapter information
+        // Log adapter information and limits
         let adapter_info = adapter.get_info();
         let adapter_limits = adapter.limits();
         console::log_1(&format!("📊 Adapter backend: {:?}", adapter_info.backend).into());
-        console::log_1(&format!("📊 Adapter limits: max_inter_stage_shader_components = {}", adapter_limits.max_inter_stage_shader_components).into());
+        console::log_1(&format!("📊 Adapter limits: max_buffer_size = {}MB", adapter_limits.max_buffer_size / (1024 * 1024)).into());
 
-        // Choose appropriate limits based on backend
+        // Choose appropriate limits based on backend and request maximum buffer size when possible
         let device_limits = match adapter_info.backend {
             wgpu::Backend::BrowserWebGpu => {
-                console::log_1(&"🚀 Using WebGPU limits".into());
-                wgpu::Limits::default()
+                console::log_1(&"🚀 Requesting maximum WebGPU limits with higher buffer size".into());
+                let mut limits = wgpu::Limits::default();
+                // Request the maximum buffer size supported by the adapter
+                limits.max_buffer_size = adapter_limits.max_buffer_size;
+                console::log_1(&format!("🚀 Requesting max_buffer_size = {}MB", limits.max_buffer_size / (1024 * 1024)).into());
+                limits
             }
             wgpu::Backend::Gl => {
                 console::log_1(&"🔧 Using WebGL2 downlevel limits".into());
@@ -265,6 +269,9 @@ impl CubeRenderer {
                 wgpu::Limits::default()
             }
         };
+
+        // Store the requested buffer size for comparison
+        let requested_buffer_size = device_limits.max_buffer_size;
 
         let (device, queue) = adapter
             .request_device(
@@ -280,6 +287,14 @@ impl CubeRenderer {
             .map_err(|e| JsValue::from_str(&format!("Failed to create device: {:?}", e)))?;
 
         console::log_1(&"✅ Device created successfully".into());
+        
+        // Log the actual device limits that were granted
+        let actual_device_limits = device.limits();
+        console::log_1(&format!("📊 Actual device limits: max_buffer_size = {}MB", 
+            actual_device_limits.max_buffer_size / (1024 * 1024)).into());
+        console::log_1(&format!("📊 Comparison: Requested={}MB, Granted={}MB", 
+            requested_buffer_size / (1024 * 1024),
+            actual_device_limits.max_buffer_size / (1024 * 1024)).into());
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -457,9 +472,27 @@ impl CubeRenderer {
 
         console::log_1(&"🎉 CubeRenderer created successfully!".into());
         
-        // Maximum number of instances for GPU instancing - support up to 8M cubes
-        // Note: 8M instances * ~32 bytes per instance = ~256MB GPU buffer
-        let max_instances = 8000000u32;
+        // Use 80% of max buffer size to leave room for other buffers and safety margin
+        let max_safe_buffer_size = (actual_device_limits.max_buffer_size as f64 * 0.8) as u64;
+        
+        // Calculate max instances based on InstanceData size and actual device buffer limit
+        let instance_data_size = std::mem::size_of::<InstanceData>() as u64;
+        let max_instances = (max_safe_buffer_size / instance_data_size) as u32;
+        
+        // Log the calculated limits
+        console::log_1(&format!(
+            "📊 Instance buffer: max_size={}MB, instance_size={}bytes, max_instances={}", 
+            max_safe_buffer_size / (1024 * 1024), 
+            instance_data_size, 
+            max_instances
+        ).into());
+        
+        // Calculate maximum supported grid size for reference
+        let max_grid_size = (max_instances as f64).cbrt().floor() as u32;
+        console::log_1(&format!(
+            "📏 Maximum supported grid: {}x{}x{} = {} cubes", 
+            max_grid_size, max_grid_size, max_grid_size, max_grid_size.pow(3)
+        ).into());
         
         // Create instance buffer for GPU instancing
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
